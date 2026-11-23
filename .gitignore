@@ -1,0 +1,8 @@
+/target/
+/dist/
+/data/
+*.key
+*.identity
+*.sqlite*
+*.pk8
+*.crt

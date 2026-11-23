@@ -1,0 +1,53 @@
+name: ChatOid release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+          - os: ubuntu-24.04
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux window dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - run: rustup update stable
+      - run: cargo +stable fmt --check
+      - run: cargo +stable test --locked
+      - run: cargo +stable build --release --locked --bins
+      - run: python tools/package.py ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chatoid-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+  distribution:
+    runs-on: ubuntu-24.04
+    needs: binaries
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chatoid-*
+          path: dist
+          merge-multiple: true
+      - run: python tools/package.py source
+      - run: python tools/package.py manifest
+      - run: python tools/package.py verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chatoid-distribution
+          path: dist/*
+          if-no-files-found: error
