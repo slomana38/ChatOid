@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
+    io::Read,
     net::SocketAddr,
     path::PathBuf,
     sync::mpsc,
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     agent::{self, Settings},
-    identity::{Card, Identity, Role, pack, unpack},
+    identity::{Card, Identity, Role, pack, unpack, write_new},
     protocol::*,
     transport::{self, Connection, RemoteError, RunningHost},
 };
@@ -162,9 +163,18 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(path: PathBuf, identity: Identity) -> Result<Self> {
+    pub fn new(path: PathBuf, identity: Identity, inbox: Option<PathBuf>) -> Result<Self> {
         let dir = path.join(identity.id());
         fs::create_dir_all(&dir)?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".session.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .context("Bu hesap başka bir ChatOid penceresinde açık")?;
+        let inbox = inbox.filter(|root| fs::create_dir_all(root.join(identity.id())).is_ok());
         let db = Database::open(dir.join("client.sqlite3"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS client(id INTEGER PRIMARY KEY, data TEXT NOT NULL);")?;
         let local = db
@@ -181,9 +191,11 @@ impl Session {
         thread::Builder::new()
             .name("chatoid-client".into())
             .spawn(move || {
+                let _lock = lock;
                 Worker {
                     db,
                     dir,
+                    inbox,
                     identity,
                     local,
                     connections: HashMap::new(),
@@ -204,6 +216,7 @@ impl Session {
 struct Worker {
     db: Database,
     dir: PathBuf,
+    inbox: Option<PathBuf>,
     identity: Identity,
     local: Local,
     connections: HashMap<String, Connection>,
@@ -257,7 +270,7 @@ impl Worker {
     }
 
     fn save(&self) -> Result<()> {
-        self.db.execute("INSERT INTO client(id,data) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+        self.db.execute("INSERT INTO client(id,data) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data WHERE client.data <> excluded.data",
             params![serde_json::to_string(&self.local)?])?;
         Ok(())
     }
@@ -375,6 +388,9 @@ impl Worker {
     }
 
     fn poll(&mut self) {
+        if let Err(error) = self.receive_local_invite() {
+            self.notice = Some(format!("Yerel davet alınamadı. {error}"));
+        }
         let hosts: Vec<_> = self.local.hosts.keys().cloned().collect();
         for pin in hosts {
             if self
@@ -429,6 +445,72 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn receive_local_invite(&mut self) -> Result<()> {
+        let Some(root) = &self.inbox else {
+            return Ok(());
+        };
+        let entries = fs::read_dir(root.join(self.identity.id()))?;
+        for entry in entries.flatten().take(32) {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("invite")
+                || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            let mut contents = String::new();
+            if fs::File::open(&path)
+                .and_then(|file| file.take(32_769).read_to_string(&mut contents))
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(ticket) = unpack::<Ticket>("invite", &contents) else {
+                continue;
+            };
+            if ticket.grant.is_some()
+                || ticket.host.check().is_err()
+                || path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| Uuid::parse_str(stem).ok())
+                    != Some(ticket.id)
+            {
+                continue;
+            }
+            if self
+                .retry_after
+                .get(&ticket.host.pin)
+                .is_some_and(|retry| *retry > Instant::now())
+            {
+                continue;
+            }
+            let pin = ticket.host.pin.clone();
+            match self.redeem(ticket) {
+                Ok(()) => {
+                    self.save()?;
+                    fs::remove_file(path)?;
+                    self.notice = Some(
+                        "Yeni davet geldi. Kişiler ve istekler bölümünden açabilirsin.".into(),
+                    );
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<RemoteError>()
+                        .is_some_and(|remote| remote.status.is_client_error()) =>
+                {
+                    fs::remove_file(path)?;
+                    self.notice = Some(format!("Yerel davet açılamadı. {error}"));
+                }
+                Err(_) => {
+                    self.retry_after
+                        .insert(pin, Instant::now() + Duration::from_secs(6));
+                }
+            }
+            break;
+        }
+        Ok(())
     }
 
     fn queue(&mut self, pin: &str, draft: Draft) -> Result<()> {
@@ -540,8 +622,25 @@ impl Worker {
             .connect(&host.pin)?
             .offer(&actor, card.clone(), group)?;
         self.local.tickets.insert(ticket.id, ticket.clone());
-        self.copy = Some(pack("invite", &ticket)?);
-        self.notice = Some("Davet bağlantısı panoya kopyalandı.".into());
+        let code = pack("invite", &ticket)?;
+        let delivered = self.inbox.as_ref().is_some_and(|root| {
+            let recipient = root.join(&request.to.data.key);
+            recipient.is_dir()
+                && write_new(
+                    &recipient.join(format!("{}.invite", ticket.id)),
+                    code.as_bytes(),
+                )
+                .is_ok()
+        });
+        self.copy = Some(code);
+        self.notice = Some(
+            if delivered {
+                "Davet bu cihazdaki alıcıya gönderildi."
+            } else {
+                "Davet bağlantısı panoya kopyalandı."
+            }
+            .into(),
+        );
         if room.is_some() {
             let dm = self.local.hosts.iter().find_map(|(pin, link)| {
                 link.rooms
@@ -641,23 +740,29 @@ impl Worker {
             }
             Command::Import(code) if code.trim().starts_with("chatoid:host:") => {
                 let address: HostAddress = unpack("host", &code)?;
-                ensure!(
-                    self.local.hosts.contains_key(&address.pin),
-                    "Yeni bir hosta önce davetle bağlan"
-                );
                 let mut connection = Connection::new(address.clone())?;
                 let pin = address.pin.clone();
-                let _: Sync = connection.call(
+                let known = self.local.hosts.get(&pin);
+                let sync: Sync = connection.call(
                     &self.identity,
                     Action::Sync {
-                        after: self.local.hosts[&pin].cursor,
+                        after: known.map_or(0, |link| link.cursor),
                         grants: vec![],
                     },
                 )?;
+                ensure!(
+                    known.is_some() || !sync.rooms.is_empty() || !sync.requests.is_empty(),
+                    "Bu hostta bu hesaba ait kayıt yok. İlk bağlantı için davet kodu gerekli."
+                );
+                let was_known = known.is_some();
                 self.add_link(address)?;
                 self.connections.insert(pin.clone(), connection);
                 self.refresh(&pin)?;
-                self.notice = Some("Host adresi güncellendi.".into());
+                self.notice = Some(if was_known {
+                    "Host adresi güncellendi.".into()
+                } else {
+                    "Hosta yeniden bağlanıldı.".into()
+                });
             }
             Command::Import(code) => self.redeem(unpack("invite", &code)?)?,
             Command::Pair(code) => {
@@ -1008,8 +1113,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let alice = Identity::generate(Role::Human, "alice", "Alice")?;
         let bob = Identity::generate(Role::Human, "bobby", "Bob")?;
-        let sender = Session::new(directory.path().join("alice"), alice.clone())?;
-        let guest = Session::new(directory.path().join("bobby"), bob.clone())?;
+        let inbox = directory.path().join("inbox");
+        let profiles = directory.path().join("profiles");
+        let sender = Session::new(profiles.clone(), alice.clone(), Some(inbox.clone()))?;
+        assert!(Session::new(profiles.clone(), alice.clone(), None).is_err());
+        let guest = Session::new(profiles.clone(), bob.clone(), Some(inbox))?;
         sender.send.send(Command::Start("127.0.0.1:0".parse()?))?;
         let address = wait(&sender, |view| view.host.is_some())?.host.unwrap();
         sender
@@ -1017,8 +1125,7 @@ mod tests {
             .send(Command::Import(pack("card", &bob.card)?))?;
         wait(&sender, |view| view.local.contacts.contains_key(bob.id()))?;
         sender.send.send(Command::Offer(bob.card.clone()))?;
-        let code = wait(&sender, |view| view.copy.is_some())?.copy.unwrap();
-        guest.send.send(Command::Import(code))?;
+        wait(&sender, |view| view.copy.is_some())?;
         let view = wait(&guest, |view| {
             view.local
                 .hosts
@@ -1072,6 +1179,34 @@ mod tests {
         })?;
         assert!(view.local.hosts[&address.pin].archived.contains(&room));
         assert_eq!(view.local.hosts[&address.pin].unread(room, bob.id()), 1);
+        assert!(!view.local.contacts.contains_key(bob.id()));
+        assert!(view.local.friend(bob.id(), alice.id()).is_some());
+        let restored = Session::new(directory.path().join("fresh"), bob.clone(), None)?;
+        restored
+            .send
+            .send(Command::Import(pack("host", &address)?))?;
+        let restored = wait(&restored, |view| {
+            view.local.friend(bob.id(), alice.id()).is_some()
+        })?;
+        assert_eq!(restored.local.hosts[&address.pin].messages.len(), 2);
+        sender.send.send(Command::Stop)?;
+        wait(&sender, |view| view.host.is_none())?;
+        for (identity, other, name, archive) in [
+            (&alice, &bob, "alice", false),
+            (&bob, &alice, "bobby", true),
+        ] {
+            let db = Database::open(profiles.join(identity.id()).join("client.sqlite3"))?;
+            let data: String =
+                db.query_row("SELECT data FROM client WHERE id=1", [], |row| row.get(0))?;
+            let local: Local = serde_json::from_str(&data)?;
+            assert!(local.friend(identity.id(), other.id()).is_some(), "{name}");
+            assert!(local.contacts.contains_key(other.id()), "{name}");
+            assert!(!local.contacts.contains_key(identity.id()), "{name}");
+            let link = &local.hosts[&address.pin];
+            assert_eq!(link.archived.contains(&room), archive, "{name}");
+            assert_eq!(link.requests[0].status, Status::Accepted, "{name}");
+            assert_eq!(link.messages.len(), 2, "{name}");
+        }
         Ok(())
     }
 }

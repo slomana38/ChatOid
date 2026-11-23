@@ -187,7 +187,7 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
     let friendship = accepted.friendship().unwrap();
     drop(first);
 
-    let (_second_dir, second, mut human_host) = host(&human)?;
+    let (second_dir, second, mut human_host) = host(&human)?;
     let mut agent_guest = Connection::new(second.address.clone())?;
     let room = Uuid::new_v4();
     assert_eq!(
@@ -245,6 +245,7 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0].seq, after.seq);
     assert!(state.messages[0].reply.is_none());
+    assert_eq!(state.rooms[0].owner, human.id());
     assert!(
         send(
             &mut agent_guest,
@@ -279,6 +280,13 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
         )
         .is_err()
     );
+    let address = second.address.clone();
+    drop(second);
+    let restarted = start(second_dir.path(), address.socket, &human)?;
+    let mut host_client = Connection::new(restarted.address.clone())?;
+    let persisted = sync(&mut host_client, &human, 0)?;
+    assert_eq!(persisted.rooms[0].id, room);
+    assert_eq!(persisted.rooms[0].owner, human.id());
     Ok(())
 }
 

@@ -1,22 +1,28 @@
-# ChatOid 0.1
+# ChatOid 0.1.1
 
 ChatOid, insanların ve yerel Codex ajanlarının bire bir ve grup sohbeti yapması için iki masaüstü istemcisi sunar. Bire bir sohbetin hostu isteği açan cihazdır. Grubun hostu grup yöneticisinin cihazıdır. Host, sohbet geçmişini SQLite’ta tutar. Cihazlar aynı yerel ağ veya VPN üzerinde HTTPS ile bağlanır.
 
 ## Başlangıç
 
-1. Windows’ta `chatoid.exe`, Linux’ta `chatoid` ile insan uygulamasını aç. **Hesap oluştur** bölümünde benzersiz bir kullanıcı adı, görünen ad ve en az 10 karakterlik bir parola seç.
-2. Sohbet başlatacak cihazda **Host** sayfasını aç. Yerel ağ veya VPN IP adresini ve boş bir portu gir. Örnek `192.168.1.20:47821` veya `100.78.12.9:47821`. Hostu başlat. Ağdaki diğer cihazların bu porta erişebilmesi gerekir. Varsayılan `127.0.0.1` adresi aynı cihazda deneme içindir.
+1. Windows’ta `chatoid.exe`, Linux’ta `chatoid` ile insan uygulamasını aç. **Hesap oluştur** bölümünde benzersiz bir kullanıcı adı, görünen ad ve en az 6 karakterlik bir parola seç.
+2. Sohbet başlatacak cihazda **Host** sayfasından yerel ağ veya VPN arayüzünü seç. Adresi ve portu elle de girebilirsin. Örnek `192.168.1.20:47821` veya `100.78.12.9:47821`. **Bu cihazı host yap** seçeneğini kullan. Ağdaki diğer cihazların bu porta erişebilmesi gerekir. Varsayılan `127.0.0.1` adresi aynı cihazda deneme içindir.
 3. Karşı taraf **Kişiler ve istekler → Kişi kartımı kopyala** ile kartını paylaşır. Kodu içe aktar, kişiyi kullanıcı adıyla bul ve **Arkadaşlık isteği gönder** seçeneğini kullan. Panoya kopyalanan davet kodunu karşı tarafa ilet.
-4. Alıcı kodu **Kişiler ve istekler** ekranında içe aktarır ve kabul eder. Bire bir sohbet iki tarafta da **Sohbetler** listesine eklenir. Aynı kullanıcı hesabı başka bir hosttan gelen daveti de açabilir.
-5. **Yeni grup** ile kendi cihazında bir grup kur. Grubun **Davet et** menüsünde arkadaşlığını kabul eden kişileri seç. Davet bire bir sohbete düşer. Panodaki davet kodunu da paylaşabilirsin. Davetli kendi kabulünden sonraki mesajları görür.
+4. Aynı cihazda ChatOid’e giriş yapmış bir alıcının isteği **Kişiler ve istekler** bölümüne doğrudan gelir. Başka bir cihazdaki alıcı, aynı ekranda davet kodunu içe aktarır. Alıcı kabul edince bire bir sohbet iki tarafta da **Sohbetler** listesine eklenir.
+5. **Yeni grup** ile kendi cihazında bir grup kur. ChatOid grubun hostu olarak kurucu hesabını kaydeder ve sohbet başlığında gösterir. Grubun **Davet et** menüsünde arkadaşlığını kabul eden kişileri seç. Davet bire bir sohbete düşer. Panodaki davet kodunu da paylaşabilirsin. Davetli kendi kabulünden sonraki mesajları görür.
 
 Bir mesaja **Yanıtla** ile alıntı ekleyebilirsin. Alıntıya tıklamak kaynak mesaja gider. Arşivlenen sohbet yeni mesaj geldiğinde arşivde kalır. Host çevrimdışıyken sıraya alınan mesajlar **Bekliyor** görünür ve bağlantı geri geldiğinde yeniden gönderilir.
 
 Host açıkken pencereyi kapatma düğmesi uygulamayı küçültür. **Hostu durdur**, **Oturumu kapat** ve **Uygulamadan çık** hostu durdurur. Host durduğunda uzaktaki üyeler önbellekteki sohbeti okuyabilir. Adres değiştiğinde aynı hostu yeni adresle başlat ve **Host bağlantısını kopyala** ile yeni kodu mevcut üyelere paylaş. Üyeler kodu **Kişiler ve istekler** ekranında içe aktarabilir.
 
+Yerel sohbet listesi boşsa ve host eski kayıtları hâlâ tutuyorsa, aynı hesabınla host bağlantısını içe aktararak arkadaşlıkları ve erişebildiğin sohbetleri yeniden eşitleyebilirsin. Bu hosta ilk kez erişecek bir hesabın davet koduna ihtiyacı vardır.
+
+Cihazdaki her ChatOid hesabı arkadaşlarını, isteklerini, sohbet önbelleğini, arşivini ve bekleyen mesajlarını kendi profiline kaydeder. Uygulama güncellendiğinde aynı cihazda, aynı hesapla ve aynı veri klasörüyle aç.
+
+Giriş ekranındaki **Beni hatırla** seçeneği, sonraki açılışta bu cihazda son seçilen insan hesabını açar. **Oturumu kapat** otomatik girişi iptal eder. Windows oturum anahtarını DPAPI ile korur. Linux'ta otomatik giriş için çalışan bir Secret Service ve `secret-tool` (`libsecret-tools`) gerekir. Bu bileşenler yoksa parola ile giriş yapabilirsin.
+
 ## Ajan kurma
 
-1. Ajan cihazında Codex CLI ile oturum aç. `chatoid-agent.exe` veya `chatoid-agent` ile ayrı ajan uygulamasını aç. **Ajan oluştur** ile ajana ait bir `.key` oluştur veya **Anahtarı aç** ile mevcut anahtarın yolunu gir.
+1. Ajan cihazında Codex CLI ile oturum aç. `chatoid-agent.exe` veya `chatoid-agent` ile ayrı ajan uygulamasını aç. **Ajan oluştur** ile kullanıcı adı, görünen ad, model adı ve görevi gir. Alt ajan oluşturuyorsan üst ajanının adını da ekle. Bu bilgiler yeni `.key` dosyasına kaydedilir. Mevcut anahtarı açmak için **Anahtarı aç** seçeneğini kullan.
 2. **Ajan** sayfasında Codex’in çalıştırılabilir dosya yolunu gir. **Deneme yanıtı al** ile bağlantıyı kontrol et. **Yeni sohbet mesajlarını değerlendir** seçeneğini aç ve ayarları kaydet.
 3. İnsan operatörünün kişi kartını **Operatörü eşleştir** alanına gir. Ajan bir istek alınca **Operatör bağlantısını kopyala** ile o isteğe özel yetki bağlantısı oluşur. Operatör bunu kendi insan uygulamasına aktarır ve isteği oradan kabul eder veya reddeder.
 4. Otomatik karar için arkadaşlık veya grup iznini ajan ayarlarından aç ve karar kurallarını yaz. Ajan ile operatör aynı anda karar verirse host ilk kaydı korur.

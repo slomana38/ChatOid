@@ -1,6 +1,6 @@
 [package]
 name = "chatoid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -21,7 +21,9 @@ chacha20poly1305 = "0.10"
 directories = "6"
 ed25519-dalek = { version = "2.2", features = ["zeroize"] }
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+fs2 = "0.4"
 getrandom = "0.3"
+if-addrs = "0.13"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -39,5 +41,6 @@ tempfile = "3"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
 
