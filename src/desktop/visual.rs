@@ -112,7 +112,7 @@ pub fn palette(role: Role) -> Palette {
             [18, 32, 32],
             [25, 43, 41],
             [46, 76, 68],
-            [162, 239, 204],
+            crate::branding::accent(false),
             [34, 70, 60],
             [26, 49, 44],
         ],
@@ -121,7 +121,7 @@ pub fn palette(role: Role) -> Palette {
             [31, 26, 48],
             [43, 36, 62],
             [76, 64, 105],
-            [198, 190, 255],
+            crate::branding::accent(true),
             [62, 49, 93],
             [49, 40, 71],
         ],
@@ -237,30 +237,9 @@ pub fn password_eye(ui: &mut Ui, rect: Rect, revealed: bool) -> egui::Response {
 }
 
 pub fn app_icon(role: Role) -> egui::IconData {
-    let colors = palette(role);
-    let size = 48_u32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    let a = pos2(12., 29.);
-    let b = pos2(24., 16.);
-    let c = pos2(36., 29.);
-    let segment = |point: Pos2, start: Pos2, end: Pos2| {
-        let span = end - start;
-        let t = ((point - start).dot(span) / span.length_sq()).clamp(0., 1.);
-        point.distance(start + span * t)
-    };
-    for y in 0..size {
-        for x in 0..size {
-            let point = pos2(x as f32 + 0.5, y as f32 + 0.5);
-            let edge = (point - pos2(24., 24.)).abs() - vec2(12., 12.);
-            let opacity = (11.5 - edge.max(Vec2::ZERO).length()).clamp(0., 1.);
-            let glyph = [a, b, c].iter().any(|node| point.distance(*node) < 2.7)
-                || segment(point, a, b).min(segment(point, b, c)) < 1.;
-            let [r, g, b, _] = if glyph { colors.base } else { colors.accent }.to_array();
-            rgba.extend([r, g, b, (255. * opacity).round() as u8]);
-        }
-    }
+    let size = 48;
     egui::IconData {
-        rgba,
+        rgba: crate::branding::icon_rgba(role == Role::Agent, size),
         width: size,
         height: size,
     }
@@ -618,6 +597,107 @@ pub fn chat_background(ui: &Ui, rect: Rect) {
     }
 }
 
+pub fn wallpaper(ui: &Ui, rect: Rect, settings: &super::preferences::Wallpaper) {
+    use super::preferences::Background;
+    if !rect.is_positive() {
+        return;
+    }
+    let paint = ui.painter_at(rect);
+    match settings.background {
+        Background::Orbit => {
+            paint.rect_filled(rect, 0., current(ui.ctx()).base);
+            chat_background(ui, rect);
+        }
+        Background::Plain => {
+            let [r, g, b] = settings.color;
+            paint.rect_filled(rect, 0., Color32::from_rgb(r, g, b));
+        }
+        Background::Photo => {
+            paint.rect_filled(rect, 0., current(ui.ctx()).base);
+            if let Some(path) = &settings.photo {
+                let id = egui::Id::new(("wallpaper", path));
+                let existing = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<egui::TextureHandle>(id));
+                let texture = existing.or_else(|| {
+                    let image = image::open(path).ok()?.into_rgba8();
+                    let cg = egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    );
+                    let texture = ui.ctx().load_texture(
+                        "Sohbet arka planı",
+                        cg,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(id, texture.clone()));
+                    Some(texture)
+                });
+                if let Some(texture) = texture {
+                    let size = texture.size_vec2();
+                    let scale = (rect.width() / size.x).max(rect.height() / size.y);
+                    paint.image(
+                        texture.id(),
+                        Rect::from_center_size(rect.center(), size * scale),
+                        Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                        Color32::WHITE,
+                    );
+                }
+            }
+        }
+    }
+    paint.rect_filled(
+        rect,
+        0.,
+        Color32::from_black_alpha((u16::from(settings.dim) * 255 / 100) as u8),
+    );
+}
+
+pub fn draft_image(ui: &mut Ui, path: &std::path::Path) {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        return;
+    }
+    let id = egui::Id::new(("draft-image", path));
+    let cached = ui
+        .ctx()
+        .data(|data| data.get_temp::<Option<egui::TextureHandle>>(id));
+    let texture = cached.unwrap_or_else(|| {
+        let load = || {
+            let mut reader = image::ImageReader::open(path)
+                .ok()?
+                .with_guessed_format()
+                .ok()?;
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(6400);
+            limits.max_image_height = Some(6400);
+            limits.max_alloc = Some(128 * 1024 * 1024);
+            reader.limits(limits);
+            let image = reader.decode().ok()?.thumbnail(96, 56).to_rgba8();
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            );
+            Some(
+                ui.ctx()
+                    .load_texture("Ek önizlemesi", color, egui::TextureOptions::LINEAR),
+            )
+        };
+        let loaded = load();
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id, loaded.clone()));
+        loaded
+    });
+    if let Some(texture) = texture {
+        ui.image((texture.id(), texture.size_vec2()));
+    }
+}
+
 const BUBBLE_PADDING: f32 = 9.;
 const MESSAGE_SIZE: f32 = 14.;
 const STAMP_SIZE: f32 = 10.5;
@@ -627,7 +707,13 @@ pub struct BubbleSize {
     inline_stamp: bool,
 }
 
-pub fn measure_bubble(ui: &Ui, body: &str, stamp: &str, extra_width: f32) -> BubbleSize {
+pub fn measure_bubble(
+    ui: &Ui,
+    body: &str,
+    stamp: &str,
+    extra_width: f32,
+    checks: u8,
+) -> BubbleSize {
     let width_of = |text: &str, size| {
         ui.painter()
             .layout_no_wrap(text.to_owned(), FontId::proportional(size), INK)
@@ -638,7 +724,7 @@ pub fn measure_bubble(ui: &Ui, body: &str, stamp: &str, extra_width: f32) -> Bub
         .lines()
         .map(|line| width_of(line, MESSAGE_SIZE))
         .fold(0_f32, f32::max);
-    let stamp_width = width_of(stamp, STAMP_SIZE);
+    let stamp_width = width_of(stamp, STAMP_SIZE) + if checks > 0 { 18. } else { 0. };
     let lane = ui.available_width();
     let maximum = (lane * 0.70).clamp(1., 414.);
     let inline_width = body_width + stamp_width + 10.;
@@ -698,13 +784,292 @@ pub fn bubble_lane(
     .inner
 }
 
-pub fn bubble_text(ui: &mut Ui, size: &BubbleSize, body: &str, stamp: &str, status: bool) {
-    let time = |ui: &mut Ui| {
-        let label = ui.label(RichText::new(stamp).size(STAMP_SIZE).color(MUTED));
-        if !status {
-            label.on_hover_text("UTC");
+pub fn participant_avatar(
+    ui: &mut Ui,
+    card: &crate::identity::Card,
+    photo: Option<&crate::protocol::AvatarPhoto>,
+) -> egui::Response {
+    profile_avatar(ui, card, photo, 28.)
+}
+
+pub fn profile_avatar(
+    ui: &mut Ui,
+    card: &crate::identity::Card,
+    photo: Option<&crate::protocol::AvatarPhoto>,
+    size: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    let accent = participant_color(&card.data.key);
+    let initials: String = card
+        .data
+        .name
+        .split_whitespace()
+        .take(2)
+        .filter_map(|word| word.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect();
+    if let Some(texture) = photo.and_then(|photo| avatar_texture(ui.ctx(), &card.data.key, photo)) {
+        let mut mesh = egui::Mesh::with_texture(texture.id());
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.center(),
+            uv: pos2(0.5, 0.5),
+            color: Color32::WHITE,
+        });
+        let segments = 32;
+        for index in 0..segments {
+            let angle = index as f32 * std::f32::consts::TAU / segments as f32;
+            let v = vec2(angle.cos(), angle.sin());
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: rect.center() + v * size / 2.,
+                uv: pos2(0.5 + v.x / 2., 0.5 + v.y / 2.),
+                color: Color32::WHITE,
+            });
+            mesh.add_triangle(0, index + 1, (index + 1) % segments + 1);
         }
-    };
+        ui.painter().add(Shape::mesh(mesh));
+    } else {
+        ui.painter()
+            .circle_filled(rect.center(), size / 2., accent.gamma_multiply(0.28));
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            initials,
+            FontId::proportional(size * 0.38),
+            accent,
+        );
+    }
+    response
+        .on_hover_text(format!("{} · @{}", card.data.name, card.data.handle))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub fn profile_hero(ui: &mut Ui, draw: impl FnOnce(&mut Ui)) {
+    let colors = current(ui.ctx());
+    let ornament = ui.painter().add(Shape::Noop);
+    let card_fill = ui.painter().add(Shape::Noop);
+    let width = ui.available_width();
+    let result = egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(17, 18))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 34.).max(0.));
+            draw(ui);
+        });
+    let rect = result.response.rect;
+    let painter = ui.painter();
+    painter.set(ornament, Shape::rect_filled(rect, 18., colors.tint));
+    let mut rings = Vec::new();
+    let center = rect.right_center() - vec2(41., 7.);
+    let clip = rect.shrink(2.);
+    let ring = Stroke::new(1_f32, colors.accent.gamma_multiply(0.19));
+    for radius in [22_f32, 33., 43.] {
+        if rect.height() >= 90. || radius < 40. {
+            let radius = radius.min((rect.height() - 8.) / 2.);
+            rings.push(Shape::circle_stroke(center, radius.max(1.), ring));
+        }
+    }
+    if clip.is_positive() {
+        painter
+            .with_clip_rect(clip)
+            .set(card_fill, Shape::Vec(rings));
+    }
+    painter.rect_stroke(
+        rect,
+        18.,
+        Stroke::new(1_f32, colors.accent.gamma_multiply(0.27)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+pub fn profile_section(ui: &mut Ui, icon: Outline, title: &str, draw: impl FnOnce(&mut Ui)) {
+    let colors = current(ui.ctx());
+    let width = ui.available_width();
+    egui::Frame::new()
+        .fill(colors.panel)
+        .stroke(Stroke::new(1_f32, colors.border.gamma_multiply(0.76)))
+        .corner_radius(14)
+        .inner_margin(egui::Margin::symmetric(15, 13))
+        .show(ui, |ui| {
+            ui.set_min_width((width - 32.).max(0.));
+            label_icon(ui, icon, RichText::new(title).size(14.).strong());
+            ui.add_space(4.);
+            draw(ui);
+        });
+}
+
+pub fn account_menu(ui: &mut Ui, name: &str, contents: impl FnOnce(&mut Ui)) {
+    let colors = current(ui.ctx());
+    let caption = ui
+        .painter()
+        .layout_no_wrap(name.to_owned(), FontId::proportional(13.), INK);
+    let button = egui::Button::new("")
+        .min_size(vec2(caption.size().x + 43., 34.))
+        .corner_radius(9)
+        .fill(colors.raised);
+    let response = egui::containers::menu::MenuButton::from_button(button)
+        .ui(ui, contents)
+        .0;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    let rect = response.rect;
+    outline(
+        ui.painter(),
+        Outline::People,
+        Rect::from_center_size(rect.left_center() + vec2(12., 0.), Vec2::splat(13.)),
+        colors.accent,
+    );
+    ui.painter().galley(
+        pos2(rect.left() + 22., rect.center().y - caption.size().y / 2.),
+        caption,
+        INK,
+    );
+    let caret = rect.right_center() - vec2(11., 0.);
+    ui.painter().add(Shape::line(
+        vec![
+            caret + vec2(-3., -1.5),
+            caret + vec2(0., 1.5),
+            caret + vec2(3., -1.5),
+        ],
+        Stroke::new(1.25_f32, colors.accent),
+    ));
+}
+
+fn avatar_texture(
+    ctx: &egui::Context,
+    key: &str,
+    photo: &crate::protocol::AvatarPhoto,
+) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("participant-photo", key));
+    if let Some((digest, texture)) =
+        ctx.data(|data| data.get_temp::<(String, egui::TextureHandle)>(id))
+        && digest == photo.digest
+    {
+        return Some(texture);
+    }
+    let image = crate::protocol::AvatarPhoto::decode(&photo.data)
+        .ok()?
+        .into_rgba8();
+    let rgba = egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.as_raw(),
+    );
+    let texture = ctx.load_texture(format!("avatar-{key}"), rgba, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, (photo.digest.clone(), texture.clone())));
+    Some(texture)
+}
+
+pub fn attachment_preview(
+    ui: &mut Ui,
+    preview: &crate::protocol::AttachmentPreview,
+    key: impl std::hash::Hash,
+) {
+    if !(1..=crate::protocol::AttachmentPreview::MAX_DIMENSION).contains(&preview.width)
+        || !(1..=crate::protocol::AttachmentPreview::MAX_DIMENSION).contains(&preview.height)
+    {
+        return;
+    }
+    let width = (preview.width as f32).min(ui.available_width());
+    let height = width * preview.height as f32 / preview.width as f32;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let cache = egui::Id::new(("attachment-preview", key));
+    let texture = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::TextureHandle>(cache))
+        .or_else(|| {
+            let image = preview.decode().ok()?.into_rgba8();
+            let rgba = egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            );
+            let texture = ui.ctx().load_texture(
+                format!("attachment-{cache:?}"),
+                rgba,
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(cache, texture.clone()));
+            Some(texture)
+        });
+    if let Some(texture) = texture {
+        ui.painter().image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+            Color32::WHITE,
+        );
+    }
+}
+
+pub fn participant_color(key: &str) -> Color32 {
+    let colors = [
+        Color32::from_rgb(157, 226, 203),
+        Color32::from_rgb(154, 199, 248),
+        Color32::from_rgb(211, 180, 247),
+        Color32::from_rgb(244, 196, 145),
+        Color32::from_rgb(244, 172, 190),
+        Color32::from_rgb(205, 225, 151),
+    ];
+    let hash = key.bytes().fold(0_usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte.into())
+    });
+    colors[hash % colors.len()]
+}
+
+pub fn message_stamp(ui: &mut Ui, stamp: &str, title: &str, ink: Color32, checks: u8) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.;
+        let time = |ui: &mut Ui| {
+            ui.label(RichText::new(stamp).size(STAMP_SIZE).color(MUTED))
+                .on_hover_text(title);
+        };
+        let mark = |ui: &mut Ui| {
+            if checks == 0 {
+                return;
+            }
+            let (rect, response) = ui.allocate_exact_size(vec2(14., 12.), egui::Sense::hover());
+            let origin = rect.left_center();
+            let painter = ui.painter();
+            if checks > 1 {
+                painter.add(Shape::line(
+                    vec![
+                        origin + vec2(6., 1.5),
+                        origin + vec2(7.5, 3.),
+                        origin + vec2(13., -3.5),
+                    ],
+                    Stroke::new(1.35_f32, ink),
+                ));
+            }
+            painter.add(Shape::line(
+                vec![
+                    origin + vec2(1., 0.5),
+                    origin + vec2(3.5, 3.),
+                    origin + vec2(9., -3.5),
+                ],
+                Stroke::new(1.35_f32, ink),
+            ));
+            response.on_hover_text(title);
+        };
+        if ui.layout().main_dir() == egui::Direction::RightToLeft {
+            mark(ui);
+            time(ui);
+        } else {
+            time(ui);
+            mark(ui);
+        }
+    });
+}
+
+pub fn bubble_text(
+    ui: &mut Ui,
+    size: &BubbleSize,
+    body: &str,
+    stamp: &str,
+    title: &str,
+    color: Color32,
+    checks: u8,
+) {
+    let time = |ui: &mut Ui| message_stamp(ui, stamp, title, color, checks);
     if size.inline_stamp {
         ui.horizontal(|ui| {
             ui.add(egui::Label::new(RichText::new(body).size(MESSAGE_SIZE)).extend());
@@ -778,6 +1143,7 @@ pub fn chat_icon_button(ui: &mut Ui, send: bool, enabled: bool) -> egui::Respons
 
 #[derive(Clone, Copy)]
 pub enum Outline {
+    Settings,
     Chat,
     Archive,
     People,
@@ -790,6 +1156,8 @@ pub enum Outline {
     Search,
     Check,
     Cross,
+    Attachment,
+    Emoji,
 }
 
 fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
@@ -900,9 +1268,44 @@ fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
             trace(&[(0.61, 0.61), (0.83, 0.83)]);
         }
         Outline::Check => trace(&[(0.20, 0.52), (0.39, 0.72), (0.81, 0.29)]),
+        Outline::Settings => {
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.29, line);
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.11, line);
+            for i in 0..8 {
+                let angle = std::f32::consts::TAU * i as f32 / 8.;
+                let (y, x) = angle.sin_cos();
+                trace(&[
+                    (0.5 + x * 0.29, 0.5 + y * 0.29),
+                    (0.5 + x * 0.40, 0.5 + y * 0.40),
+                ]);
+            }
+        }
         Outline::Cross => {
             trace(&[(0.25, 0.25), (0.75, 0.75)]);
             trace(&[(0.75, 0.25), (0.25, 0.75)]);
+        }
+        Outline::Attachment => trace(&[
+            (0.63, 0.32),
+            (0.63, 0.73),
+            (0.56, 0.83),
+            (0.41, 0.83),
+            (0.29, 0.72),
+            (0.29, 0.28),
+            (0.39, 0.16),
+            (0.54, 0.16),
+            (0.75, 0.29),
+            (0.75, 0.72),
+            (0.60, 0.93),
+            (0.35, 0.93),
+            (0.18, 0.73),
+            (0.18, 0.28),
+        ]),
+        Outline::Emoji => {
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.36, line);
+            for x in [0.38, 0.62] {
+                paint.circle_filled(at(x, 0.40), rect.width() * 0.04, ink);
+            }
+            trace(&[(0.34, 0.60), (0.43, 0.69), (0.57, 0.69), (0.66, 0.60)]);
         }
     }
 }
@@ -910,6 +1313,85 @@ fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
 pub fn small_icon(ui: &mut Ui, icon: Outline) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.), egui::Sense::hover());
     outline(ui.painter(), icon, rect, current(ui.ctx()).accent);
+}
+
+pub fn rail_button(ui: &mut Ui, icon: Outline, label: &str, active: bool) -> egui::Response {
+    let colors = current(ui.ctx());
+    let response = ui.add_sized(
+        [40., 40.],
+        egui::Button::new("").corner_radius(10).fill(if active {
+            colors.tint
+        } else {
+            Color32::TRANSPARENT
+        }),
+    );
+    outline(
+        ui.painter(),
+        icon,
+        Rect::from_center_size(response.rect.center(), Vec2::splat(22.)),
+        if active || response.hovered() {
+            colors.accent
+        } else {
+            MUTED
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.on_hover_text(label)
+}
+
+pub fn avatar_option(ui: &mut Ui, index: usize, selected: bool) -> egui::Response {
+    let [r, g, b] = crate::protocol::AVATAR_PRESETS[index];
+    let color = Color32::from_rgb(r, g, b);
+    let response = ui.add_sized(
+        [32., 32.],
+        egui::Button::new("")
+            .corner_radius(16)
+            .fill(Color32::from_rgb(27, 29, 43))
+            .stroke(if selected {
+                Stroke::new(2_f32, color)
+            } else {
+                Stroke::NONE
+            }),
+    );
+    let center = response.rect.center();
+    match index % 3 {
+        0 => {
+            ui.painter().circle_filled(center, 8., color);
+        }
+        1 => {
+            ui.painter().add(Shape::convex_polygon(
+                vec![
+                    center + vec2(0., -9.),
+                    center + vec2(9., 0.),
+                    center + vec2(0., 9.),
+                    center + vec2(-9., 0.),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        _ => {
+            ui.painter()
+                .rect_filled(Rect::from_center_size(center, Vec2::splat(14.)), 1., color);
+        }
+    }
+    response.on_hover_text(format!("Avatar {}", index + 1))
+}
+
+pub fn composer_popup(ui: &mut Ui, icon: Outline, label: &str, contents: impl FnOnce(&mut Ui)) {
+    let button = ui.menu_button("", contents).response;
+    outline(
+        ui.painter(),
+        icon,
+        Rect::from_center_size(button.rect.center(), Vec2::splat(19.)),
+        if button.hovered() {
+            current(ui.ctx()).accent
+        } else {
+            MUTED
+        },
+    );
+    button.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    button.on_hover_text(label);
 }
 
 pub fn label_icon(ui: &mut Ui, icon: Outline, text: RichText) {
@@ -1077,6 +1559,25 @@ pub fn host_map(ui: &mut Ui, hosting: bool, connected: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_marks_use_one_or_two_vector_paths() {
+        for checks in [0, 1, 2] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    message_stamp(ui, "21:50", "Mesaj durumu", Color32::LIGHT_BLUE, checks);
+                });
+            });
+            let traces = output.shapes.iter().filter(|entry| {
+                matches!(&entry.shape, Shape::Path(path) if !path.closed && path.points.len() == 3)
+            }).count();
+            assert_eq!(traces, usize::from(checks));
+            assert!(output.shapes.iter().any(|entry| {
+                matches!(&entry.shape, Shape::Text(text) if text.galley.job.text == "21:50")
+            }));
+        }
+    }
 
     #[test]
     fn orbit_marks_move_between_frames() {

@@ -32,7 +32,7 @@ def checksum(path):
 def source_files():
     return sorted(ROOT.glob("src/**/*.rs")) + sorted(ROOT.glob("tests/*.rs")) + [
         ROOT / name
-        for name in (*DOCS, "Cargo.toml", "Cargo.lock", ".gitignore", ".gitattributes", "tools/package.py",
+        for name in (*DOCS, "Cargo.toml", "Cargo.lock", "build.rs", ".gitignore", ".gitattributes", "tools/package.py",
                      ".github/workflows/release.yml")
     ]
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -8,10 +8,11 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -20,7 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    identity::{Card, Role, encode, random, verify},
+    identity::{Card, Role, decode, encode, random, verify},
     protocol::*,
 };
 
@@ -50,11 +51,39 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS room_messages ON messages(room, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS source_agent_reply ON messages(actor, reply) WHERE root IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS root_agent_reply ON messages(actor, root) WHERE root IS NOT NULL;
+CREATE TABLE IF NOT EXISTS attachments (
+  seq INTEGER PRIMARY KEY REFERENCES messages(seq), name TEXT NOT NULL,
+  data TEXT NOT NULL, bytes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS friendship_checks (
+  request TEXT PRIMARY KEY REFERENCES requests(id), proof TEXT NOT NULL, authority TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS introductions (
+  id TEXT PRIMARY KEY, sender TEXT NOT NULL, expires INTEGER NOT NULL, ticket TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS public_profiles (
+  actor TEXT PRIMARY KEY REFERENCES profiles(id), publication TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS binary_files (
+  seq INTEGER PRIMARY KEY REFERENCES attachments(seq), hash TEXT NOT NULL, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS upload_chunks (
+  actor TEXT NOT NULL REFERENCES profiles(id), id TEXT NOT NULL, offset INTEGER NOT NULL,
+  data BLOB NOT NULL, updated INTEGER NOT NULL, PRIMARY KEY(actor,id,offset));
+CREATE TABLE IF NOT EXISTS attachment_previews (
+  seq INTEGER PRIMARY KEY REFERENCES attachments(seq), preview TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS avatars (
+  actor TEXT PRIMARY KEY REFERENCES profiles(id), digest TEXT NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS delivery (actor TEXT PRIMARY KEY REFERENCES profiles(id), seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS reads (
+  actor TEXT NOT NULL REFERENCES profiles(id), room TEXT NOT NULL REFERENCES rooms(id),
+  seq INTEGER NOT NULL, PRIMARY KEY(actor, room));
 ";
 
 const VISIBLE: &str = "
 EXISTS (SELECT 1 FROM members m WHERE m.room = messages.room AND m.actor = ?1
   AND messages.seq > m.after_seq AND (m.through_seq IS NULL OR messages.seq <= m.through_seq))";
+
+const SHARED_AVATAR: &str = "(
+  avatars.actor=?1 OR EXISTS(SELECT 1 FROM members peer JOIN members own ON own.room=peer.room
+    WHERE peer.actor=avatars.actor AND own.actor=?1 AND peer.through_seq IS NULL AND own.through_seq IS NULL
+  )
+)";
 
 #[derive(Default)]
 struct Auth {
@@ -109,7 +138,10 @@ impl Host {
             .route("/v1/challenge", post(challenge))
             .route("/v1/login", post(login))
             .route("/v1/action", post(action))
-            .layer(DefaultBodyLimit::max(64 * 1024))
+            .route("/v1/friendship", post(friendship))
+            .route("/v1/upload/{id}/{offset}", post(upload))
+            .route("/v1/file/{seq}/{offset}", get(download_binary))
+            .layer(DefaultBodyLimit::max(2 * MAX_ATTACHMENT))
             .with_state(self)
     }
 
@@ -158,11 +190,17 @@ impl Host {
     }
 
     fn apply(&self, actor: &Card, action: Action) -> Result<Value> {
+        self.check_group_relationship(actor, &action)?;
         let mut connection = self.db.lock().expect("database lock");
         let db = connection.transaction()?;
         let id = &actor.data.key;
         let value = match action {
-            Action::Sync { after, grants } => self.sync(&db, id, after, grants)?,
+            Action::Sync {
+                after,
+                grants,
+                read,
+                avatar,
+            } => self.sync(&db, id, after, grants, read, avatar)?,
             Action::History { room, before } => {
                 ensure!(ever_member(&db, room, id)?, "Sohbet erişimi yok");
                 let ids = message_ids(
@@ -199,14 +237,69 @@ impl Host {
                 target,
                 friendship,
                 code_hash,
-            } => self.offer(&db, actor, terms, target, friendship.as_deref(), &code_hash)?,
+                authority,
+            } => {
+                let id = terms.data.id;
+                let result =
+                    self.offer(&db, actor, terms, target, friendship.as_deref(), &code_hash)?;
+                if let (Some(proof), Some(authority)) = (friendship, authority) {
+                    db.execute(
+                        "INSERT OR IGNORE INTO friendship_checks VALUES(?1,?2,?3)",
+                        params![
+                            id.to_string(),
+                            serde_json::to_string(&proof)?,
+                            serde_json::to_string(&authority)?
+                        ],
+                    )?;
+                }
+                result
+            }
             Action::Redeem {
                 id: request,
                 code,
                 grant,
             } => self.redeem(&db, id, request, &code, grant.as_ref())?,
             Action::Decide { decision } => self.decide(&db, id, decision)?,
-            Action::Send { draft } => serde_json::to_value(send(&db, actor, draft)?)?,
+            Action::Send { draft } => serde_json::to_value(send(&db, actor, draft, None)?)?,
+            Action::SendBinary {
+                draft,
+                name,
+                bytes,
+                hash,
+            } => {
+                ensure!(actor.data.role == Role::Human, "İnsan hesabı gerekli");
+                check_filename(&name)?;
+                ensure!(
+                    draft.attachment.is_none()
+                        && draft.invitation.is_none()
+                        && (1..=MAX_BINARY_ATTACHMENT).contains(&bytes),
+                    "Geçersiz dosya eki"
+                );
+                decode::<32>(&hash)?;
+                let id = draft.id;
+                let message = send(&db, actor, draft, Some((name, bytes, hash)))?;
+                db.execute(
+                    "DELETE FROM upload_chunks WHERE actor=?1 AND id=?2",
+                    params![actor.data.key, id.to_string()],
+                )?;
+                serde_json::to_value(message)?
+            }
+            Action::Download { room, seq } => {
+                ensure!(visible(&db, id, seq)?, "Dosyaya erişim yok");
+                let file = db.query_row(
+                    "SELECT a.name,a.data FROM attachments a JOIN messages m ON m.seq=a.seq WHERE m.room=?1 AND m.seq=?2",
+                    params![room.to_string(), seq],
+                    |row| Ok(Attachment { name: row.get(0)?, data: row.get(1)? }),
+                ).context("Mesajın dosya eki yok")?;
+                json!(file)
+            }
+            Action::Avatar { actor, digest } => {
+                let data: String = db.query_row(
+                    &format!("SELECT data FROM avatars WHERE {SHARED_AVATAR} AND actor=?2 AND digest=?3"),
+                    params![id, actor, digest], |row| row.get(0),
+                ).context("Profil fotoğrafı bulunamadı")?;
+                json!(AvatarPhoto { digest, data })
+            }
             Action::Leave { room } => {
                 let (owner, group, _) = room_settings(&db, room)?;
                 ensure!(group && owner != *id, "Yalnızca grup üyesi ayrılabilir");
@@ -231,9 +324,192 @@ impl Host {
                 db.execute("UPDATE rooms SET closed=1 WHERE id=?1", [room.to_string()])?;
                 Value::Null
             }
+            Action::EndFriendship { room } => {
+                let (_, group, _) = room_settings(&db, room)?;
+                ensure!(
+                    !group && ever_member(&db, room, id)?,
+                    "Arkadaşlığı yalnızca katılımcılar sonlandırabilir"
+                );
+                db.execute("UPDATE rooms SET closed=1 WHERE id=?1", [room.to_string()])?;
+                Value::Null
+            }
+            Action::DeliverIntroduction { route, ticket } => {
+                ContactRoute::validate(&route)?;
+                ensure!(
+                    route.data.card.data.key == self.owner
+                        && route.data.host.pin == self.pin
+                        && actor.data.key != self.owner
+                        && ticket.grant.is_none(),
+                    "Bu kişi bağlantısı bu hosta ait değil"
+                );
+                ticket.host.check()?;
+                db.execute("DELETE FROM introductions WHERE expires<=?1", [now()])?;
+                let count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM introductions WHERE sender=?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let existing: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM introductions WHERE id=?1 AND sender=?2)",
+                    params![ticket.id.to_string(), id],
+                    |row| row.get(0),
+                )?;
+                ensure!(
+                    existing || count < 5,
+                    "Bu adrese çok fazla istek gönderildi"
+                );
+                db.execute(
+                    "INSERT OR IGNORE INTO introductions VALUES(?1,?2,?3,?4)",
+                    params![
+                        ticket.id.to_string(),
+                        id,
+                        route.data.expires.min(now() + INVITE_LIFETIME),
+                        serde_json::to_string(&ticket)?,
+                    ],
+                )?;
+                Value::Null
+            }
+            Action::PublishProfile { publication } => {
+                verify(id, "shared-profile", &publication.profile)?;
+                crate::identity::validate_name(&publication.profile.data.display_name)?;
+                if let Some(profile) = &publication.profile.data.agent {
+                    ensure!(actor.data.role == Role::Agent, "Ajan hesabı gerekli");
+                    profile.validate()?;
+                }
+                if let Some(device) = &publication.device {
+                    ensure!(actor.data.role == Role::Agent, "Ajan hesabı gerekli");
+                    verify(id, "device-summary", device)?;
+                    for value in [
+                        &device.data.system,
+                        &device.data.architecture,
+                        &device.data.processor,
+                        &device.data.memory,
+                    ] {
+                        ensure!(
+                            value.len() <= 120 && !value.chars().any(char::is_control),
+                            "Geçersiz cihaz özeti"
+                        );
+                    }
+                }
+                db.execute("INSERT INTO public_profiles VALUES(?1,?2) ON CONFLICT(actor) DO UPDATE SET publication=excluded.publication",
+                    params![id,serde_json::to_string(&publication)?])?;
+                Value::Null
+            }
+            Action::LoadProfile { actor } => {
+                let shared: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members a JOIN members b USING(room)
+                     WHERE a.actor=?1 AND b.actor=?2 AND a.through_seq IS NULL AND b.through_seq IS NULL)",
+                    params![id,actor], |row| row.get(0))?;
+                ensure!(id == &actor || shared, "Profil erişimi yok");
+                let raw = db
+                    .query_row(
+                        "SELECT publication FROM public_profiles WHERE actor=?1",
+                        [&actor],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let mut publication = raw
+                    .as_deref()
+                    .map(serde_json::from_str::<ProfilePublication>)
+                    .transpose()?;
+                let friends: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM members a JOIN members b USING(room) JOIN rooms r ON r.id=a.room
+                     WHERE a.actor=?1 AND b.actor=?2 AND r.closed=0 AND r.is_group=0 AND a.through_seq IS NULL AND b.through_seq IS NULL)",
+                    params![id,actor], |row| row.get(0))?;
+                if id != &actor
+                    && !friends
+                    && let Some(profile) = &mut publication
+                {
+                    profile.device = None;
+                }
+                json!(publication)
+            }
         };
         db.commit()?;
         Ok(value)
+    }
+
+    fn check_group_relationship(&self, actor: &Card, action: &Action) -> Result<()> {
+        let (proof, authority) = match action {
+            Action::Offer {
+                terms,
+                friendship,
+                authority,
+                ..
+            } if terms.data.room.is_some() => {
+                ensure!(
+                    actor.data.key == self.owner && terms.data.from == self.owner,
+                    "Grup davetini host sahibi açabilir"
+                );
+                verify(&self.owner, "offer", terms)?;
+                let proof = friendship.as_deref().context("Arkadaşlık kanıtı eksik")?;
+                proof.check(&terms.data.from, &terms.data.to)?;
+                (
+                    proof.clone(),
+                    authority.clone().context("Arkadaşlık hostu bilinmiyor")?,
+                )
+            }
+            Action::Decide { decision }
+                if decision.proof.data.accepted && decision.proof.data.terms.room.is_some() =>
+            {
+                let terms = &decision.proof.data.terms;
+                decision.check(&actor.data.key, terms)?;
+                let db = self.db.lock().expect("database lock");
+                if request(&db, terms.id)?.is_some_and(|r| r.status == Status::Accepted) {
+                    return Ok(());
+                }
+                let (proof, authority): (String, String) = db
+                    .query_row(
+                        "SELECT proof,authority FROM friendship_checks WHERE request=?1",
+                        [terms.id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .context("Bu grup daveti güncel doğrulama içermiyor. Yeni davet iste.")?;
+                (
+                    serde_json::from_str(&proof)?,
+                    serde_json::from_str(&authority)?,
+                )
+            }
+            _ => return Ok(()),
+        };
+        ensure!(
+            authority.pin == proof.terms.data.host,
+            "Arkadaşlık hostu uyuşmuyor"
+        );
+        let active = if authority.pin == self.pin {
+            self.relationship_active(&proof)?
+        } else {
+            match crate::transport::Connection::new(authority)?.friendship_active(&proof) {
+                Ok(active) => active,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::transport::RemoteError>()
+                        .is_none() =>
+                {
+                    return Err(AuthorityUnavailable.into());
+                }
+                Err(error) => {
+                    return Err(error.context("Arkadaşlık hostu güncel doğrulama yapamadı"));
+                }
+            }
+        };
+        ensure!(active, "Arkadaşlık sona ermiş veya doğrulanamadı");
+        Ok(())
+    }
+
+    fn relationship_active(&self, proof: &Friendship) -> Result<bool> {
+        let terms = &proof.terms.data;
+        proof.check(&terms.from, &terms.to)?;
+        ensure!(terms.host == self.pin, "Arkadaşlık bu hosta ait değil");
+        let db = self.db.lock().expect("database lock");
+        if request(&db, terms.id)?
+            .and_then(|r| r.friendship())
+            .as_ref()
+            != Some(proof)
+        {
+            return Ok(false);
+        }
+        Ok(!room_settings(&db, terms.id)?.2)
     }
 
     fn offer(
@@ -295,7 +571,8 @@ impl Host {
             let exists: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM requests WHERE room IS NULL AND
                 ((sender=?1 AND recipient=?2) OR (sender=?2 AND recipient=?1))
-                AND (result=1 OR (result IS NULL AND expires>?3)))",
+                AND ((result=1 AND EXISTS(SELECT 1 FROM rooms WHERE rooms.id=requests.id AND closed=0))
+                     OR (result IS NULL AND expires>?3)))",
                 params![t.from, t.to, now()],
                 |r| r.get(0),
             )?;
@@ -399,8 +676,85 @@ impl Host {
         Ok(json!(offer))
     }
 
-    fn sync(&self, db: &Connection, actor: &str, after: i64, grants: Vec<Grant>) -> Result<Value> {
-        ensure!(after >= 0 && grants.len() <= 20, "Geçersiz eşitleme");
+    fn sync(
+        &self,
+        db: &Connection,
+        actor: &str,
+        after: i64,
+        grants: Vec<Grant>,
+        read: BTreeMap<Uuid, i64>,
+        avatar: Option<AvatarUpdate>,
+    ) -> Result<Value> {
+        ensure!(
+            after >= 0 && grants.len() <= 20 && read.len() <= 500,
+            "Geçersiz eşitleme"
+        );
+        if let Some(update) = avatar {
+            if let Some(data) = update.data {
+                AvatarPhoto::decode(&data)?;
+                let digest = AvatarPhoto::digest(&data);
+                db.execute("INSERT INTO avatars VALUES(?1,?2,?3) ON CONFLICT(actor) DO UPDATE SET digest=excluded.digest,data=excluded.data WHERE avatars.digest<>excluded.digest",
+                    params![actor, digest, data])?;
+            } else {
+                db.execute("DELETE FROM avatars WHERE actor=?1", [actor])?;
+            }
+        }
+        let avatar_index = {
+            let mut statement = db.prepare(&format!(
+                "SELECT actor,digest FROM avatars WHERE {SHARED_AVATAR}"
+            ))?;
+            statement
+                .query_map([actor], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+        };
+        let high = high_water(db)?;
+        let delivered = after.min(high);
+        if delivered > 0 {
+            db.execute("INSERT INTO delivery VALUES(?1,?2) ON CONFLICT(actor) DO UPDATE SET seq=excluded.seq WHERE delivery.seq < excluded.seq", params![actor, delivered])?;
+        }
+        for (room, seq) in read {
+            if db.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE room=?2 AND seq=?3 AND {VISIBLE})"
+                ),
+                params![actor, room.to_string(), seq],
+                |row| row.get::<_, bool>(0),
+            )? {
+                db.execute("INSERT INTO reads VALUES(?1,?2,?3) ON CONFLICT(actor, room) DO UPDATE SET seq=excluded.seq WHERE reads.seq < excluded.seq",
+                    params![actor, room.to_string(), seq])?;
+            }
+        }
+        let receipts = {
+            let mut statement = db.prepare(
+                "SELECT peer.room,peer.actor,peer.after_seq,COALESCE(d.seq,0),COALESCE(r.seq,0)
+                 FROM members peer LEFT JOIN delivery d ON d.actor=peer.actor
+                 LEFT JOIN reads r ON r.actor=peer.actor AND r.room=peer.room
+                 WHERE peer.actor<>?1 AND peer.through_seq IS NULL AND EXISTS
+                 (SELECT 1 FROM members own WHERE own.actor=?1 AND own.room=peer.room AND own.through_seq IS NULL)
+                 ORDER BY peer.room,peer.actor",
+            )?;
+            statement
+                .query_map([actor], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (room, actor, joined_after, delivered, read) = row?;
+                    Ok(Receipt {
+                        room: Uuid::parse_str(&room)?,
+                        actor,
+                        joined_after,
+                        delivered,
+                        read,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let rooms = {
             let mut statement = db.prepare("SELECT DISTINCT room FROM members WHERE actor=?1")?;
             statement
@@ -444,17 +798,33 @@ impl Host {
         let cursor = if ids.len() == PAGE {
             ids[PAGE - 1]
         } else {
-            high_water(db)?.max(after)
+            high.max(after)
         };
         let messages = ids
             .into_iter()
             .map(|seq| message(db, actor, seq))
             .collect::<Result<Vec<_>>>()?;
+        let introductions = if actor == self.owner {
+            let mut statement = db.prepare(
+                "SELECT ticket FROM introductions WHERE expires>?1 ORDER BY rowid DESC LIMIT 250",
+            )?;
+            statement
+                .query_map([now()], |row| row.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
         Ok(json!(Sync {
             cursor,
             rooms,
             requests,
-            messages
+            messages,
+            receipts,
+            supports_attachments: true,
+            avatar_index,
+            introductions,
+            max_file_bytes: MAX_BINARY_ATTACHMENT,
         }))
     }
 }
@@ -642,6 +1012,56 @@ fn visible(db: &Connection, actor: &str, seq: i64) -> Result<bool> {
     )?)
 }
 
+fn attachment_info(db: &Connection, seq: i64) -> Result<Option<AttachmentInfo>> {
+    let row = db
+        .query_row(
+            "SELECT a.name,a.bytes,p.preview,EXISTS(SELECT 1 FROM binary_files b WHERE b.seq=a.seq) FROM attachments a LEFT JOIN attachment_previews p ON p.seq=a.seq WHERE a.seq=?1",
+            [seq],
+            |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(name, bytes, preview, binary)| {
+        Ok(AttachmentInfo {
+            name,
+            bytes,
+            preview: preview.as_deref().map(serde_json::from_str).transpose()?,
+            binary,
+        })
+    })
+    .transpose()
+}
+
+fn attachment_preview(bytes: &[u8]) -> Result<Option<AttachmentPreview>> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    if !matches!(
+        reader.format(),
+        Some(image::ImageFormat::Jpeg | image::ImageFormat::Png)
+    ) {
+        return Ok(None);
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(24 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    let edge = image
+        .width()
+        .max(image.height())
+        .min(AttachmentPreview::MAX_DIMENSION);
+    let thumbnail = image.thumbnail(edge, edge).to_rgb8();
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 77).encode_image(&thumbnail)?;
+    let data = encode(bytes);
+    Ok(
+        (data.len() <= MAX_AVATAR_DATA).then_some(AttachmentPreview {
+            width: thumbnail.width(),
+            height: thumbnail.height(),
+            data,
+        }),
+    )
+}
+
 fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
     let (id, author, raw, sent_at, reply, root): (
         String,
@@ -678,7 +1098,11 @@ fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
         quote = Some(Quote {
             id: source,
             author: profile(db, &author)?,
-            text: original.text.chars().take(240).collect(),
+            text: if original.text.is_empty() {
+                attachment_info(db, source)?.map_or_else(String::new, |file| file.name)
+            } else {
+                original.text.chars().take(240).collect()
+            },
         });
     }
     Ok(Message {
@@ -691,12 +1115,32 @@ fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
         reply: quote,
         root,
         invitation: draft.invitation,
+        attachment: attachment_info(db, seq)?,
     })
 }
 
-fn send(db: &Connection, actor: &Card, mut draft: Draft) -> Result<Message> {
+fn send(
+    db: &Connection,
+    actor: &Card,
+    mut draft: Draft,
+    binary: Option<(String, usize, String)>,
+) -> Result<Message> {
     let author = &actor.data.key;
-    draft.text = clean(&draft.text, MAX_TEXT)?;
+    let attachment = draft.attachment.take();
+    let file_bytes = if let Some(file) = &attachment {
+        ensure!(
+            draft.invitation.is_none(),
+            "Davetle birlikte dosya gönderilemez"
+        );
+        Some(file.bytes()?)
+    } else {
+        None
+    };
+    draft.text = if (attachment.is_some() || binary.is_some()) && draft.text.trim().is_empty() {
+        String::new()
+    } else {
+        clean(&draft.text, MAX_TEXT)?
+    };
     let payload = serde_json::to_string(&draft)?;
     let existing: Option<(i64, String)> = db
         .query_row(
@@ -706,8 +1150,29 @@ fn send(db: &Connection, actor: &Card, mut draft: Draft) -> Result<Message> {
         )
         .optional()?;
     if let Some((seq, original)) = existing {
+        if let Some(expected) = binary {
+            let saved = db.query_row("SELECT a.name,a.bytes,b.hash FROM attachments a JOIN binary_files b USING(seq) WHERE seq=?1",
+                [seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?, r.get::<_, String>(2)?))).optional()?;
+            ensure!(
+                original == payload && saved == Some(expected),
+                "Mesaj kimliği başka içerikle kullanılmış"
+            );
+            return message(db, author, seq);
+        }
+        let original_attachment = db
+            .query_row(
+                "SELECT name,data FROM attachments WHERE seq=?1",
+                [seq],
+                |row| {
+                    Ok(Attachment {
+                        name: row.get(0)?,
+                        data: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
         ensure!(
-            original == payload,
+            original == payload && original_attachment == attachment,
             "Mesaj kimliği başka içerikle kullanılmış"
         );
         return message(db, author, seq);
@@ -774,23 +1239,92 @@ fn send(db: &Connection, actor: &Card, mut draft: Draft) -> Result<Message> {
     }
     db.execute("INSERT INTO messages(room,actor,client_id,time,payload,reply,root) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![draft.room.to_string(),author,draft.id.to_string(),now(),payload,draft.reply,root])?;
-    message(db, author, db.last_insert_rowid())
+    let seq = db.last_insert_rowid();
+    if let Some(file) = attachment {
+        db.execute(
+            "INSERT INTO attachments VALUES(?1,?2,?3,?4)",
+            params![seq, file.name, file.data, file.info().bytes],
+        )?;
+        if let Some(preview) = file_bytes
+            .as_deref()
+            .and_then(|bytes| attachment_preview(bytes).ok().flatten())
+        {
+            db.execute(
+                "INSERT INTO attachment_previews VALUES(?1,?2)",
+                params![seq, serde_json::to_string(&preview)?],
+            )?;
+        }
+    }
+    if let Some((name, bytes, hash)) = binary {
+        let mut statement = db.prepare(
+            "SELECT offset,data FROM upload_chunks WHERE actor=?1 AND id=?2 ORDER BY offset",
+        )?;
+        let chunks = statement.query_map(params![author, draft.id.to_string()], |row| {
+            Ok((row.get::<_, usize>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut content = Vec::with_capacity(bytes);
+        for chunk in chunks {
+            let (offset, chunk) = chunk?;
+            ensure!(
+                offset == content.len() && offset + chunk.len() <= bytes,
+                "Dosya aktarımı tamamlanmadı"
+            );
+            content.extend(chunk);
+        }
+        ensure!(
+            content.len() == bytes && digest(&content) == hash,
+            "Dosya doğrulanamadı"
+        );
+        db.execute(
+            "INSERT INTO attachments VALUES(?1,?2,'',?3)",
+            params![seq, name, bytes],
+        )?;
+        db.execute(
+            "INSERT INTO binary_files VALUES(?1,?2,?3)",
+            params![seq, hash, content],
+        )?;
+        if let Some(preview) = attachment_preview(&content).ok().flatten() {
+            db.execute(
+                "INSERT INTO attachment_previews VALUES(?1,?2)",
+                params![seq, serde_json::to_string(&preview)?],
+            )?;
+        }
+    }
+    message(db, author, seq)
 }
 
 pub fn mentions(text: &str, handle: &str) -> bool {
-    text.match_indices('@').any(|(i, _)| {
-        !text[..i]
+    mention_ranges(text).any(|range| text[range.start + 1..range.end].eq_ignore_ascii_case(handle))
+}
+
+pub(crate) fn mention_ranges(text: &str) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    text.match_indices('@').filter_map(|(start, _)| {
+        if text[..start]
             .chars()
             .next_back()
             .is_some_and(|c| c.is_alphanumeric() || c == '_')
-            && text[i + 1..]
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .next()
-                .is_some_and(|word| word.eq_ignore_ascii_case(handle))
+        {
+            return None;
+        }
+        let handle = text[start + 1..]
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()?;
+        (!handle.is_empty()).then_some(start..start + 1 + handle.len())
     })
 }
 
 struct Failure(StatusCode, String);
+
+#[derive(Debug)]
+struct AuthorityUnavailable;
+
+impl std::fmt::Display for AuthorityUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Arkadaşlık hostundan güncel doğrulama bekleniyor")
+    }
+}
+
+impl std::error::Error for AuthorityUnavailable {}
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -799,7 +1333,9 @@ impl IntoResponse for Failure {
 }
 
 fn invalid(error: anyhow::Error) -> Failure {
-    if error.downcast_ref::<rusqlite::Error>().is_some() {
+    if error.downcast_ref::<AuthorityUnavailable>().is_some() {
+        Failure(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+    } else if error.downcast_ref::<rusqlite::Error>().is_some() {
         eprintln!("ChatOid host: {error:#}");
         Failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -832,6 +1368,103 @@ async fn login(
     Json(login): Json<SignIn>,
 ) -> Result<Json<String>, Failure> {
     blocking(move || host.login(login)).await
+}
+
+async fn friendship(
+    State(host): State<Arc<Host>>,
+    Json(proof): Json<Friendship>,
+) -> Result<Json<bool>, Failure> {
+    blocking(move || host.relationship_active(&proof)).await
+}
+
+async fn upload(
+    State(host): State<Arc<Host>>,
+    RoutePath((id, offset)): RoutePath<(Uuid, usize)>,
+    headers: HeaderMap,
+    chunk: Bytes,
+) -> Result<Json<()>, Failure> {
+    let actor = host
+        .auth(&headers)
+        .ok_or_else(|| Failure(StatusCode::UNAUTHORIZED, "Oturum geçersiz".into()))?;
+    blocking(move || {
+        ensure!(
+            actor.data.role == Role::Human
+                && offset.is_multiple_of(FILE_CHUNK)
+                && (1..=FILE_CHUNK).contains(&chunk.len())
+                && offset <= MAX_BINARY_ATTACHMENT - chunk.len(),
+            "Geçersiz dosya parçası"
+        );
+        let db = host.db.lock().expect("database lock");
+        let id = id.to_string();
+        let published: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE actor=?1 AND client_id=?2)",
+            params![actor.data.key, id],
+            |row| row.get(0),
+        )?;
+        if published {
+            return Ok(());
+        }
+        db.execute("DELETE FROM upload_chunks WHERE updated<?1", [now() - 3600])?;
+        let previous: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT data FROM upload_chunks WHERE actor=?1 AND id=?2 AND offset=?3",
+                params![actor.data.key, id, offset],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            ensure!(previous == chunk.as_ref(), "Yükleme parçası değişti");
+            return Ok(());
+        }
+        let total: usize = db.query_row(
+            "SELECT COALESCE(SUM(length(data)),0) FROM upload_chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        let owned: usize = db.query_row(
+            "SELECT COALESCE(SUM(length(data)),0) FROM upload_chunks WHERE actor=?1",
+            [&actor.data.key],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            total + chunk.len() <= 8 * MAX_BINARY_ATTACHMENT
+                && owned + chunk.len() <= 2 * MAX_BINARY_ATTACHMENT,
+            "Host dosya kuyruğu dolu"
+        );
+        db.execute(
+            "INSERT INTO upload_chunks VALUES(?1,?2,?3,?4,?5)",
+            params![actor.data.key, id, offset, chunk.as_ref(), now()],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+async fn download_binary(
+    State(host): State<Arc<Host>>,
+    RoutePath((seq, offset)): RoutePath<(i64, usize)>,
+    headers: HeaderMap,
+) -> Result<Bytes, Failure> {
+    let actor = host
+        .auth(&headers)
+        .ok_or_else(|| Failure(StatusCode::UNAUTHORIZED, "Oturum geçersiz".into()))?;
+    blocking(move || {
+        let db = host.db.lock().expect("database lock");
+        ensure!(
+            offset < MAX_BINARY_ATTACHMENT && visible(&db, &actor.data.key, seq)?,
+            "Dosyaya erişim yok"
+        );
+        let bytes: Vec<u8> = db
+            .query_row(
+                "SELECT substr(data,?2,?3) FROM binary_files WHERE seq=?1",
+                params![seq, offset + 1, FILE_CHUNK],
+                |row| row.get(0),
+            )
+            .context("Dosya bulunamadı")?;
+        Ok(bytes)
+    })
+    .await
+    .map(|Json(bytes)| Bytes::from(bytes))
 }
 
 async fn action(

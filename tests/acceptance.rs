@@ -1,8 +1,11 @@
 use anyhow::Result;
 use chatoid::{
     agent::{self, FilePermit, Settings},
-    identity::{Identity, Role},
-    protocol::{Action, Decision, Draft, Grant, Message, Request, Status, Sync, Ticket},
+    identity::{Identity, Role, encode},
+    protocol::{
+        AVATAR_PX, Action, Attachment, AvatarPhoto, AvatarUpdate, Decision, Draft, Grant, Message,
+        Request, Status, Sync, Ticket,
+    },
     transport::{Connection, RunningHost, start},
 };
 use serde_json::Value;
@@ -56,6 +59,8 @@ fn sync(connection: &mut Connection, actor: &Identity, cursor: i64) -> Result<Sy
         Action::Sync {
             after: cursor,
             grants: vec![],
+            read: Default::default(),
+            avatar: None,
         },
     )
 }
@@ -67,11 +72,300 @@ fn draft(room: Uuid, text: &str, reply: Option<i64>) -> Draft {
         text: text.into(),
         reply,
         invitation: None,
+        attachment: None,
     }
 }
 
 fn send(connection: &mut Connection, actor: &Identity, draft: Draft) -> Result<Message> {
     connection.call(actor, Action::Send { draft })
+}
+
+#[test]
+fn full_size_binary_file_is_atomic_private_and_idempotent() -> Result<()> {
+    use chatoid::{
+        host::digest,
+        protocol::{FILE_CHUNK, MAX_BINARY_ATTACHMENT},
+    };
+    let sender = human()?;
+    let receiver = Identity::generate(Role::Human, "alici", "Alıcı")?;
+    let outsider = Identity::generate(Role::Human, "yabanci", "Yabancı")?;
+    let (_dir, runtime, mut author) = host(&sender)?;
+    let mut guest = Connection::new(runtime.address.clone())?;
+    let mut stranger = Connection::new(runtime.address.clone())?;
+    let (_, ticket) = author.offer(&sender, receiver.card.clone(), None)?;
+    let request = redeem(&mut guest, &receiver, &ticket)?;
+    decide(&mut guest, &receiver, &request, true, None)?;
+    let room = request.terms.data.id;
+    let draft = draft(room, "", None);
+    let chunk = vec![27; FILE_CHUNK];
+    let bytes = MAX_BINARY_ATTACHMENT;
+    let hash = digest(vec![27; bytes]);
+    let commit = || Action::SendBinary {
+        draft: draft.clone(),
+        name: "dosya.bin".into(),
+        bytes,
+        hash: hash.clone(),
+    };
+    author.upload_chunk(&sender, draft.id, 0, &chunk)?;
+    assert!(author.call::<Message>(&sender, commit()).is_err());
+    assert!(sync(&mut guest, &receiver, 0)?.messages.is_empty());
+    for offset in (0..bytes).step_by(FILE_CHUNK) {
+        author.upload_chunk(&sender, draft.id, offset, &chunk)?;
+    }
+    let message: Message = author.call(&sender, commit())?;
+    assert!(message.attachment.as_ref().unwrap().binary);
+    assert_eq!(author.call::<Message>(&sender, commit())?.seq, message.seq);
+    assert!(stranger.download_chunk(&outsider, message.seq, 0).is_err());
+    for offset in (0..bytes).step_by(FILE_CHUNK) {
+        assert_eq!(guest.download_chunk(&receiver, message.seq, offset)?, chunk);
+    }
+    Ok(())
+}
+
+#[test]
+fn single_contact_link_delivers_and_ending_friendship_invalidates_old_proof() -> Result<()> {
+    use chatoid::protocol::{ContactRoute, INVITE_LIFETIME, now};
+    let sender = human()?;
+    let recipient = Identity::generate(Role::Human, "duru", "Duru")?;
+    let (_authority_dir, authority, mut source) = host(&sender)?;
+    let (_target_dir, target, mut target_owner) = host(&recipient)?;
+    let route = recipient.sign(
+        "contact-route",
+        ContactRoute {
+            card: recipient.card.clone(),
+            host: target.address.clone(),
+            expires: now() + INVITE_LIFETIME,
+        },
+    )?;
+    let (_, ticket) = source.offer(&sender, recipient.card.clone(), None)?;
+    let mut relay = Connection::new(target.address.clone())?;
+    for _ in 0..2 {
+        relay.call::<Value>(
+            &sender,
+            Action::DeliverIntroduction {
+                route: Box::new(route.clone()),
+                ticket: ticket.clone(),
+            },
+        )?;
+    }
+    let inbox = sync(&mut target_owner, &recipient, 0)?.introductions;
+    assert_eq!(inbox.len(), 1);
+    let mut guest = Connection::new(authority.address.clone())?;
+    let requested = redeem(&mut guest, &recipient, &inbox[0])?;
+    let proof = decide(&mut guest, &recipient, &requested, true, None)?
+        .friendship()
+        .unwrap();
+    let dm = requested.terms.data.id;
+    send(&mut source, &sender, draft(dm, "Geçmiş kalır", None))?;
+    let group = Uuid::new_v4();
+    target_owner.call::<Uuid>(
+        &recipient,
+        Action::Group {
+            id: group,
+            name: "Ekip".into(),
+        },
+    )?;
+    let (_, invite) = target_owner.offer_with_authority(
+        &recipient,
+        sender.card.clone(),
+        Some((group, proof.clone())),
+        Some(authority.address.clone()),
+    )?;
+    let mut group_guest = Connection::new(target.address.clone())?;
+    let group_pending = redeem(&mut group_guest, &sender, &invite)?;
+    guest.call::<Value>(&recipient, Action::EndFriendship { room: dm })?;
+    assert!(
+        sync(&mut source, &sender, 0)?
+            .rooms
+            .iter()
+            .any(|room| room.id == dm && room.closed)
+    );
+    assert_eq!(sync(&mut guest, &recipient, 0)?.messages.len(), 1);
+    assert!(send(&mut source, &sender, draft(dm, "Reddedilir", None)).is_err());
+    assert!(decide(&mut group_guest, &sender, &group_pending, true, None).is_err());
+    assert!(!source.friendship_active(&proof)?);
+    let (_, again) = source.offer(&sender, recipient.card.clone(), None)?;
+    assert_ne!(again.id, dm);
+    Ok(())
+}
+
+#[test]
+fn agent_device_summary_is_returned_only_to_active_friends() -> Result<()> {
+    use chatoid::protocol::{DeviceSummary, ProfilePublication, PublicProfile};
+    let human = human()?;
+    let agent = agent_identity()?;
+    let outsider = Identity::generate(Role::Human, "konuk", "Konuk")?;
+    let (_dir, running, mut owner) = host(&human)?;
+    let mut guest = Connection::new(running.address.clone())?;
+    let mut unrelated = Connection::new(running.address.clone())?;
+    let (profile, device) = (
+        agent.sign(
+            "shared-profile",
+            PublicProfile {
+                display_name: "Poyraz".into(),
+                agent: None,
+            },
+        )?,
+        agent.sign(
+            "device-summary",
+            DeviceSummary {
+                system: "Windows 11".into(),
+                architecture: "x86_64".into(),
+                processor: "8 mantıksal işlemci".into(),
+                memory: "16 GiB".into(),
+            },
+        )?,
+    );
+    guest.call::<Value>(
+        &agent,
+        Action::PublishProfile {
+            publication: Box::new(ProfilePublication {
+                profile,
+                device: Some(device),
+            }),
+        },
+    )?;
+    let load = || Action::LoadProfile {
+        actor: agent.id().into(),
+    };
+    assert!(
+        unrelated
+            .call::<Option<ProfilePublication>>(&outsider, load())
+            .is_err()
+    );
+    let (_, invite) = owner.offer(&human, agent.card.clone(), None)?;
+    let request = redeem(&mut guest, &agent, &invite)?;
+    let proof = decide(&mut guest, &agent, &request, true, None)?
+        .friendship()
+        .unwrap();
+    let info = owner
+        .call::<Option<ProfilePublication>>(&human, load())?
+        .unwrap();
+    assert_eq!(info.device.unwrap().data.memory, "16 GiB");
+    let group = Uuid::new_v4();
+    owner.call::<Uuid>(
+        &human,
+        Action::Group {
+            id: group,
+            name: "Ortak grup".into(),
+        },
+    )?;
+    let (_, ticket) = owner.offer(&human, agent.card.clone(), Some((group, proof)))?;
+    let pending = redeem(&mut guest, &agent, &ticket)?;
+    decide(&mut guest, &agent, &pending, true, None)?;
+    owner.call::<Value>(
+        &human,
+        Action::EndFriendship {
+            room: request.terms.data.id,
+        },
+    )?;
+    let info = owner
+        .call::<Option<ProfilePublication>>(&human, load())?
+        .unwrap();
+    assert!(info.device.is_none());
+    Ok(())
+}
+
+#[test]
+fn files_photos_and_receipts_are_visible_only_in_shared_chats() -> Result<()> {
+    let sender = human()?;
+    let receiver = Identity::generate(Role::Human, "yagmur", "Yağmur")?;
+    let outsider = Identity::generate(Role::Human, "misafir", "Misafir")?;
+    let (_directory, running, mut author) = host(&sender)?;
+    let mut guest = Connection::new(running.address.clone())?;
+    let mut stranger = Connection::new(running.address.clone())?;
+    let (_, invite) = author.offer(&sender, receiver.card.clone(), None)?;
+    let request = redeem(&mut guest, &receiver, &invite)?;
+    decide(&mut guest, &receiver, &request, true, None)?;
+    let room = request.terms.data.id;
+
+    let image = image::RgbImage::from_pixel(AVATAR_PX, AVATAR_PX, image::Rgb([55, 142, 140]));
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode_image(&image)?;
+    let data = encode(&jpeg);
+    let digest = AvatarPhoto::digest(&data);
+    author.call::<Sync>(
+        &sender,
+        Action::Sync {
+            after: 0,
+            grants: vec![],
+            read: Default::default(),
+            avatar: Some(AvatarUpdate {
+                data: Some(data.clone()),
+            }),
+        },
+    )?;
+    assert!(sync(&mut stranger, &outsider, 0)?.avatar_index.is_empty());
+    assert_eq!(
+        sync(&mut guest, &receiver, 0)?.avatar_index[sender.id()],
+        digest
+    );
+    let request_photo = || Action::Avatar {
+        actor: sender.id().into(),
+        digest: digest.clone(),
+    };
+    assert!(
+        stranger
+            .call::<AvatarPhoto>(&outsider, request_photo())
+            .is_err()
+    );
+    assert_eq!(
+        guest.call::<AvatarPhoto>(&receiver, request_photo())?.data,
+        data
+    );
+
+    let mut outgoing = draft(room, "", None);
+    outgoing.attachment = Some(Attachment {
+        name: "örnek.jpg".into(),
+        data,
+    });
+    let message = send(&mut author, &sender, outgoing.clone())?;
+    assert_eq!(
+        send(&mut author, &sender, outgoing.clone())?.seq,
+        message.seq
+    );
+    outgoing.attachment.as_mut().unwrap().name = "başka.jpg".into();
+    assert!(send(&mut author, &sender, outgoing).is_err());
+    let received = sync(&mut guest, &receiver, 0)?;
+    let file = received.messages[0].attachment.as_ref().unwrap();
+    assert_eq!(file.name, "örnek.jpg");
+    assert_eq!(file.bytes, jpeg.len());
+    assert_eq!(file.preview.as_ref().unwrap().decode()?.width(), AVATAR_PX);
+    let fetch = || Action::Download {
+        room,
+        seq: message.seq,
+    };
+    assert!(stranger.call::<Attachment>(&outsider, fetch()).is_err());
+    assert!(
+        guest
+            .call::<Attachment>(
+                &receiver,
+                Action::Download {
+                    room: Uuid::new_v4(),
+                    seq: message.seq,
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(guest.call::<Attachment>(&receiver, fetch())?.bytes()?, jpeg);
+
+    assert_eq!(sync(&mut author, &sender, 0)?.receipts[0].delivered, 0);
+    sync(&mut guest, &receiver, received.cursor)?;
+    let delivered = sync(&mut author, &sender, 0)?;
+    assert_eq!(delivered.receipts[0].delivered, message.seq);
+    assert_eq!(delivered.receipts[0].read, 0);
+    guest.call::<Sync>(
+        &receiver,
+        Action::Sync {
+            after: received.cursor,
+            grants: vec![],
+            read: [(room, message.seq)].into(),
+            avatar: None,
+        },
+    )?;
+    assert_eq!(sync(&mut author, &sender, 0)?.receipts[0].read, message.seq);
+    assert!(sync(&mut stranger, &outsider, 0)?.receipts.is_empty());
+    Ok(())
 }
 
 #[test]
@@ -185,7 +479,7 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
     let friend = redeem(&mut human_guest, &human, &ticket)?;
     let accepted = decide(&mut human_guest, &human, &friend, true, None)?;
     let friendship = accepted.friendship().unwrap();
-    drop(first);
+    let authority = first.address.clone();
 
     let (second_dir, second, mut human_host) = host(&human)?;
     let mut agent_guest = Connection::new(second.address.clone())?;
@@ -212,8 +506,12 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
             .is_err()
     );
     let before = send(&mut human_host, &human, draft(room, "Üyelik öncesi", None))?;
-    let (_, invite) =
-        human_host.offer(&human, agent.card.clone(), Some((room, friendship.clone())))?;
+    let (_, invite) = human_host.offer_with_authority(
+        &human,
+        agent.card.clone(),
+        Some((room, friendship.clone())),
+        Some(authority.clone()),
+    )?;
     let pending = redeem(&mut agent_guest, &agent, &invite)?;
     assert!(sync(&mut agent_guest, &agent, 0)?.rooms.is_empty());
     assert!(
@@ -229,7 +527,12 @@ fn cross_host_group_requires_separate_acceptance_and_enforces_history() -> Resul
         Status::Rejected
     );
     assert!(sync(&mut agent_guest, &agent, 0)?.rooms.is_empty());
-    let (_, invite) = human_host.offer(&human, agent.card.clone(), Some((room, friendship)))?;
+    let (_, invite) = human_host.offer_with_authority(
+        &human,
+        agent.card.clone(),
+        Some((room, friendship)),
+        Some(authority),
+    )?;
     let pending = redeem(&mut agent_guest, &agent, &invite)?;
     decide(&mut agent_guest, &agent, &pending, true, None)?;
     let after = send(

@@ -4,7 +4,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        CreateIcon, DestroyIcon, HICON, ICON_BIG, IsWindow, SendMessageW, WM_GETICON, WM_SETICON,
+        CreateIcon, DestroyIcon, HICON, ICON_BIG, ICON_SMALL, IsWindow, SendMessageW, WM_GETICON,
+        WM_SETICON,
     },
 };
 
@@ -12,7 +13,8 @@ use crate::identity::Role;
 
 pub struct TaskbarIcon {
     window: HWND,
-    icon: HICON,
+    big: HICON,
+    small: HICON,
     role: Role,
 }
 
@@ -27,55 +29,81 @@ pub fn update(current: &mut Option<TaskbarIcon>, frame: &eframe::Frame, role: Ro
 }
 
 fn set_for_window(current: &mut Option<TaskbarIcon>, window: HWND, role: Role) {
-    if current
+    if let Some(icon) = current
         .as_ref()
-        .is_some_and(|icon| icon.window == window && icon.role == role)
+        .filter(|icon| icon.window == window && icon.role == role)
     {
+        icon.install();
         return;
     }
-    let image = super::visual::app_icon(role);
-    let mut bgra = image.rgba;
-    let mask_stride = image.width.div_ceil(32) as usize * 4;
-    let mut mask = vec![0_u8; mask_stride * image.height as usize];
+    let big = create_icon(role, 64);
+    let small = create_icon(role, 24);
+    let replacement = TaskbarIcon {
+        window,
+        big,
+        small,
+        role,
+    };
+    if big.is_null() || small.is_null() {
+        return;
+    }
+    replacement.install();
+    *current = Some(replacement);
+}
+
+fn create_icon(role: Role, size: u32) -> HICON {
+    let mut bgra = crate::branding::icon_rgba(role == Role::Agent, size);
+    let mask_stride = size.div_ceil(32) as usize * 4;
+    let mut mask = vec![0_u8; mask_stride * size as usize];
     for (index, pixel) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         pixel.swap(0, 2);
         if pixel[3] == 0 {
-            let (x, y) = (index % image.width as usize, index / image.width as usize);
+            let (x, y) = (index % size as usize, index / size as usize);
             mask[y * mask_stride + x / 8] |= 0x80 >> (x % 8);
         }
     }
-    // CreateIcon copies both buffers. Winit manages ICON_SMALL independently.
-    let icon = unsafe {
+    // CreateIcon copies both buffers.
+    unsafe {
         CreateIcon(
             null_mut(),
-            image.width as i32,
-            image.height as i32,
+            size as i32,
+            size as i32,
             1,
             32,
             mask.as_ptr(),
             bgra.as_ptr(),
         )
-    };
-    if icon.is_null() {
-        return;
     }
-    unsafe {
-        SendMessageW(window, WM_SETICON, ICON_BIG as usize, icon as isize);
+}
+
+impl TaskbarIcon {
+    fn install(&self) {
+        for (kind, icon) in [(ICON_BIG, self.big), (ICON_SMALL, self.small)] {
+            unsafe {
+                if SendMessageW(self.window, WM_GETICON, kind as usize, 0) != icon as isize {
+                    SendMessageW(self.window, WM_SETICON, kind as usize, icon as isize);
+                }
+            }
+        }
     }
-    *current = Some(TaskbarIcon { window, icon, role });
 }
 
 impl Drop for TaskbarIcon {
     fn drop(&mut self) {
         // Detach only if this handle is still installed. A role change installs
         // its replacement before this destructor releases the previous icon.
-        unsafe {
-            if IsWindow(self.window) != 0
-                && SendMessageW(self.window, WM_GETICON, ICON_BIG as usize, 0) == self.icon as isize
-            {
-                SendMessageW(self.window, WM_SETICON, ICON_BIG as usize, 0);
+        for (kind, icon) in [(ICON_BIG, self.big), (ICON_SMALL, self.small)] {
+            if icon.is_null() {
+                continue;
             }
-            DestroyIcon(self.icon);
+            unsafe {
+                if IsWindow(self.window) != 0
+                    && SendMessageW(self.window, WM_GETICON, kind as usize, 0) == icon as isize
+                {
+                    SendMessageW(self.window, WM_SETICON, kind as usize, 0);
+                }
+                DestroyIcon(icon);
+            }
         }
     }
 }
@@ -89,7 +117,7 @@ mod tests {
     };
 
     #[test]
-    fn role_switch_replaces_windows_large_icon() {
+    fn role_switch_replaces_both_icons_and_restores_a_reset_handle() {
         let window = unsafe {
             CreateWindowExW(
                 0,
@@ -107,12 +135,18 @@ mod tests {
             )
         };
         assert!(!window.is_null());
-        let read = || unsafe { SendMessageW(window, WM_GETICON, ICON_BIG as usize, 0) };
+        let read = || {
+            [ICON_BIG, ICON_SMALL]
+                .map(|kind| unsafe { SendMessageW(window, WM_GETICON, kind as usize, 0) })
+        };
         let mut icon = None;
         set_for_window(&mut icon, window, Role::Human);
         let human = read();
         set_for_window(&mut icon, window, Role::Agent);
         let agent = read();
+        unsafe {
+            SendMessageW(window, WM_SETICON, ICON_BIG as usize, 0);
+        }
         set_for_window(&mut icon, window, Role::Agent);
         let unchanged = read();
         drop(icon);
@@ -120,10 +154,10 @@ mod tests {
         unsafe {
             DestroyWindow(window);
         }
-        assert_ne!(human, 0);
-        assert_ne!(agent, 0);
+        assert!(human.into_iter().all(|icon| icon != 0));
+        assert!(agent.into_iter().all(|icon| icon != 0));
         assert_ne!(human, agent);
         assert_eq!(agent, unchanged);
-        assert_eq!(cleared, 0);
+        assert_eq!(cleared, [0, 0]);
     }
 }

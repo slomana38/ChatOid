@@ -314,6 +314,19 @@ impl Connection {
         target: crate::identity::Card,
         room: Option<(uuid::Uuid, Friendship)>,
     ) -> Result<(Request, Ticket)> {
+        let authority = room.as_ref().and_then(|(_, proof)| {
+            (proof.terms.data.host == self.address.pin).then(|| self.address.clone())
+        });
+        self.offer_with_authority(actor, target, room, authority)
+    }
+
+    pub fn offer_with_authority(
+        &mut self,
+        actor: &Identity,
+        target: crate::identity::Card,
+        room: Option<(uuid::Uuid, Friendship)>,
+        authority: Option<HostAddress>,
+    ) -> Result<(Request, Ticket)> {
         let code = encode(crate::identity::random::<32>()?);
         let id = uuid::Uuid::new_v4();
         let ticket = Ticket {
@@ -340,8 +353,83 @@ impl Connection {
                 target,
                 friendship: room.map(|(_, proof)| Box::new(proof)),
                 code_hash: digest(&ticket.code),
+                authority,
             },
         )?;
         Ok((request, ticket))
+    }
+
+    pub fn friendship_active(&self, proof: &Friendship) -> Result<bool> {
+        parse(
+            self.http
+                .post(self.url("friendship"))
+                .json(proof)
+                .send()
+                .context("Arkadaşlık hostundan güncel doğrulama bekleniyor")?,
+        )
+    }
+
+    fn binary_request(
+        &mut self,
+        identity: &Identity,
+        request: impl Fn(&Self) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response> {
+        if self
+            .token
+            .as_ref()
+            .is_none_or(|(actor, _)| actor != identity.id())
+        {
+            self.login(identity)?;
+        }
+        let send = |this: &Self| {
+            request(this)
+                .bearer_auth(&this.token.as_ref().expect("authenticated").1)
+                .send()
+        };
+        let mut response = send(self)?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.login(identity)?;
+            response = send(self)?;
+        }
+        Ok(response)
+    }
+
+    pub fn upload_chunk(
+        &mut self,
+        identity: &Identity,
+        id: uuid::Uuid,
+        offset: usize,
+        chunk: &[u8],
+    ) -> Result<()> {
+        let path = format!("upload/{id}/{offset}");
+        parse(self.binary_request(identity, |this| {
+            this.http
+                .post(this.url(&path))
+                .header("content-type", "application/octet-stream")
+                .body(chunk.to_vec())
+        })?)
+    }
+
+    pub fn download_chunk(
+        &mut self,
+        identity: &Identity,
+        seq: i64,
+        offset: usize,
+    ) -> Result<Vec<u8>> {
+        let path = format!("file/{seq}/{offset}");
+        let response = self.binary_request(identity, |this| this.http.get(this.url(&path)))?;
+        if !response.status().is_success() {
+            return parse(response);
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        response
+            .take((crate::protocol::FILE_CHUNK + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= crate::protocol::FILE_CHUNK,
+            "Geçersiz dosya parçası"
+        );
+        Ok(bytes)
     }
 }

@@ -247,6 +247,29 @@ pub fn check(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+pub fn sign_in(codex: &str) -> Result<()> {
+    let mut child = codex_command(codex)?
+        .arg("login")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Codex oturum açma işlemi başlatılamadı")?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            ensure!(status.success(), "OpenAI girişi tamamlanamadı");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("OpenAI girişi zaman aşımına uğradı");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn inspect(root: &Dir, name: &str) -> Result<String> {
     let path = Path::new(name);
     ensure!(
@@ -313,18 +336,29 @@ fn inspect(root: &Dir, name: &str) -> Result<String> {
     Ok(names.join("\n"))
 }
 
+fn codex_command(codex: &str) -> Result<Command> {
+    let codex = codex.trim();
+    ensure!(!codex.is_empty(), "Codex yolu gerekli");
+    let mut program = PathBuf::from(codex);
+    if program.components().count() > 1 {
+        program = program.canonicalize().context("Codex yolu bulunamadı")?;
+    }
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    Ok(command)
+}
+
 fn run(settings: &Settings, prompt: &Value) -> Result<Output> {
     let staging = tempfile::Builder::new()
         .prefix("chatoid-codex-")
         .tempdir()?;
     let schema = staging.path().join("response.json");
     fs::write(&schema, OUTPUT_SCHEMA)?;
-    let mut program = PathBuf::from(settings.codex.trim());
-    ensure!(!settings.codex.trim().is_empty(), "Codex yolu gerekli");
-    if program.components().count() > 1 {
-        program = program.canonicalize().context("Codex yolu bulunamadı")?;
-    }
-    let mut command = Command::new(program);
+    let mut command = codex_command(&settings.codex)?;
     command
         .args([
             "-a",
@@ -350,11 +384,6 @@ fn run(settings: &Settings, prompt: &Value) -> Result<Output> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
     let mut child = command.spawn().context("Codex başlatılamadı")?;
     let mut input = child.stdin.take().context("Codex giriş akışı bulunamadı")?;
     let log = child

@@ -1,6 +1,6 @@
 [package]
 name = "chatoid"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -24,6 +24,7 @@ eframe = { version = "0.33.3", default-features = false, features = ["default_fo
 fs2 = "0.4"
 getrandom = "0.3"
 if-addrs = "0.13"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -36,11 +37,17 @@ uuid = { version = "1", features = ["v4", "serde"] }
 x509-parser = "0.18"
 zeroize = "1"
 tempfile = "3"
+time = { version = "0.3", features = ["local-offset"] }
+
+[build-dependencies]
+embed-resource = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+arboard = "3.7"
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging"] }
+rfd = { version = "0.17.2", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 

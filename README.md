@@ -1,4 +1,4 @@
-# ChatOid 0.1.1
+# ChatOid 0.1.2
 
 ChatOid, insanların ve yerel Codex ajanlarının bire bir ve grup sohbeti yapması için iki masaüstü istemcisi sunar. Bire bir sohbetin hostu isteği açan cihazdır. Grubun hostu grup yöneticisinin cihazıdır. Host, sohbet geçmişini SQLite’ta tutar. Cihazlar aynı yerel ağ veya VPN üzerinde HTTPS ile bağlanır.
 
@@ -12,7 +12,13 @@ ChatOid, insanların ve yerel Codex ajanlarının bire bir ve grup sohbeti yapma
 
 Bir mesaja **Yanıtla** ile alıntı ekleyebilirsin. Alıntıya tıklamak kaynak mesaja gider. Arşivlenen sohbet yeni mesaj geldiğinde arşivde kalır. Host çevrimdışıyken sıraya alınan mesajlar **Bekliyor** görünür ve bağlantı geri geldiğinde yeniden gönderilir.
 
-Host açıkken pencereyi kapatma düğmesi uygulamayı küçültür. **Hostu durdur**, **Oturumu kapat** ve **Uygulamadan çık** hostu durdurur. Host durduğunda uzaktaki üyeler önbellekteki sohbeti okuyabilir. Adres değiştiğinde aynı hostu yeni adresle başlat ve **Host bağlantısını kopyala** ile yeni kodu mevcut üyelere paylaş. Üyeler kodu **Kişiler ve istekler** ekranında içe aktarabilir.
+Grup sohbetinde `@` yazarak bir üyeyi etiketleyebilir, bir avatara veya etikete tıklayarak kişi profilini açabilirsin. **Profilim** ekranında görünen ad ve fotoğraf değiştirilebilir. Ajan kaydında hazır ad ve avatar önerileri bulunur. Ajanın **Gizlilik** ayarında özetlenen cihaz bilgileri varsayılan olarak kabul edilmiş arkadaşlara görünür. Sohbetin sağ tık menüsündeki **Mesaj bilgisi** gönderim saatini ve alıcıların teslim veya okuma durumunu gösterir.
+
+Windows’ta ataç, sürükle-bırak veya mesaj alanında `Ctrl+V` ile ek seçebilirsin. Güncel hostlarda sınır 32 MiB, eski hostlarda uygulamanın gösterdiği sınır geçerlidir. Ekler önce taslakta görünür. JPG ve PNG sohbet içinde önizlenir. Taslaklar hesap ve sohbet başına saklanır. **Ayarlar → Görünüm** ile bir arka plan seçebilir ve seçili sohbete özel arka plan belirleyebilirsin.
+
+**Kişiler ve istekler → Bağlantımı paylaş** ile tek bir imzalı bağlantı paylaşabilirsin. Alıcıya gidecek istek, alıcının hostu çevrimdışıyken kuyrukta kalır. Aynı cihazdaki profiller, gizlilik ayarında izin verirlerse kişi ekleme ekranında görünür. **Arkadaşlıktan çıkar** işlemi bire bir sohbeti iki tarafta salt okunur yapar ve geçmişi saklar. Ayrı bir hosttaki grup daveti ve kabulü, ilgili arkadaşlık hostundan güncel doğrulama bekler.
+
+Pencereyi kapatma düğmesi ve **Uygulamadan çık** istemciyi ve bu istemcinin çalıştırdığı hostu kapatır. Host açık kalsın istiyorsan pencereyi küçült. **Hostu durdur** ve **Oturumu kapat** da hostu durdurur. Host durduğunda uzaktaki üyeler önbellekteki sohbeti okuyabilir. Adres değiştiğinde aynı hostu yeni adresle başlat ve **Host bağlantısını kopyala** ile yeni kodu mevcut üyelere paylaş. Üyeler kodu **Kişiler ve istekler** ekranında içe aktarabilir.
 
 Yerel sohbet listesi boşsa ve host eski kayıtları hâlâ tutuyorsa, aynı hesabınla host bağlantısını içe aktararak arkadaşlıkları ve erişebildiğin sohbetleri yeniden eşitleyebilirsin. Bu hosta ilk kez erişecek bir hesabın davet koduna ihtiyacı vardır.
 
@@ -23,7 +29,7 @@ Giriş ekranındaki **Beni hatırla** seçeneği, sonraki açılışta bu cihazd
 ## Ajan kurma
 
 1. Ajan cihazında Codex CLI ile oturum aç. `chatoid-agent.exe` veya `chatoid-agent` ile ayrı ajan uygulamasını aç. **Ajan oluştur** ile kullanıcı adı, görünen ad, model adı ve görevi gir. Alt ajan oluşturuyorsan üst ajanının adını da ekle. Bu bilgiler yeni `.key` dosyasına kaydedilir. Mevcut anahtarı açmak için **Anahtarı aç** seçeneğini kullan.
-2. **Ajan** sayfasında Codex’in çalıştırılabilir dosya yolunu gir. **Deneme yanıtı al** ile bağlantıyı kontrol et. **Yeni sohbet mesajlarını değerlendir** seçeneğini aç ve ayarları kaydet.
+2. **Ajan** sayfasında Codex’in çalıştırılabilir dosya yolunu gir. Gerekirse **OpenAI ile giriş yap** düğmesiyle tarayıcıda Codex oturumunu aç. **Deneme yanıtı al** ile bağlantıyı kontrol et. **Yeni sohbet mesajlarını değerlendir** seçeneğini aç ve ayarları kaydet.
 3. İnsan operatörünün kişi kartını **Operatörü eşleştir** alanına gir. Ajan bir istek alınca **Operatör bağlantısını kopyala** ile o isteğe özel yetki bağlantısı oluşur. Operatör bunu kendi insan uygulamasına aktarır ve isteği oradan kabul eder veya reddeder.
 4. Otomatik karar için arkadaşlık veya grup iznini ajan ayarlarından aç ve karar kurallarını yaz. Ajan ile operatör aynı anda karar verirse host ilk kaydı korur.
 5. Ajan üye olduktan sonra salt okunur bir klasör seç. **Çalışma klasörü** bölümünde hangi sohbetten hangi kişilerin dosya incelemesi isteyebileceğini işaretle ve kaydet. Grupta `@poyraz`, alıntılı yanıt veya «Poyraz, README.md dosyasını incele» gibi doğal bir hitap kullan.
