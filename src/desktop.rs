@@ -7,6 +7,8 @@ use eframe::egui::{
 };
 use zeroize::Zeroize;
 
+#[path = "desktop/image_viewer.rs"]
+mod image_viewer;
 #[cfg(windows)]
 #[path = "desktop/paste.rs"]
 mod paste;
@@ -24,13 +26,15 @@ use preferences::{Background, DraftState, Preferences};
 use visual::{INK, MUTED, Outline};
 
 use crate::{
-    agent::{FilePermit, Settings},
+    agent::{FilePermit, Settings, TaskAccess},
     host::{mention_ranges, mentions},
     identity::{
         AgentProfile, Card, HANDLE_RULE, Identity, NAME_RULE, PASSWORD_MIN, Role, pack,
         password_rule, validate_handle, validate_name, validate_password,
     },
-    protocol::{AvatarPhoto, Grant, Message, Receipt, Request, Room, Status, allowed_ip},
+    protocol::{
+        AvatarPhoto, Grant, Message, MessageMode, Receipt, Request, Room, Status, allowed_ip,
+    },
     session::{Command, Link, Selection, Session, View},
 };
 
@@ -113,6 +117,37 @@ enum Page {
     Profile,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfilePane {
+    Name,
+    Photo,
+}
+
+impl ProfilePane {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Name => "Görünen ad",
+            Self::Photo => "Profil fotoğrafı",
+        }
+    }
+
+    fn icon(self) -> Outline {
+        match self {
+            Self::Name => Outline::Edit,
+            Self::Photo => Outline::People,
+        }
+    }
+}
+
+#[derive(Default)]
+struct McpForm {
+    name: String,
+    remote: bool,
+    url: String,
+    command: String,
+    args: String,
+}
+
 struct App {
     role: Role,
     data: PathBuf,
@@ -145,6 +180,7 @@ struct App {
     new_group_open: bool,
     selected: Option<Selection>,
     draft: String,
+    draft_mode: Option<MessageMode>,
     preferences: Preferences,
     saved_preferences: Preferences,
     submitted: Option<(Selection, uuid::Uuid, DraftState)>,
@@ -155,10 +191,16 @@ struct App {
     signup_avatar: Option<PathBuf>,
     signup_palette: Option<usize>,
     profile_edit: String,
+    profile_pane: Option<ProfilePane>,
+    profile_focus_editor: bool,
+    profile_return_focus: Option<egui::Id>,
+    workspace_jobs_opener: Option<egui::Id>,
     contact_target: Option<crate::identity::Signed<crate::protocol::ContactRoute>>,
     pending_removal: Option<Selection>,
+    pending_clear: Option<(Selection, String)>,
     device_preview: Option<crate::protocol::DeviceSummary>,
     attachment: Option<PathBuf>,
+    viewer: image_viewer::Viewer,
     profile_card: Option<Card>,
     message_details: Option<(Selection, i64)>,
     reply: Option<(i64, String, String)>,
@@ -168,6 +210,7 @@ struct App {
     confirm_close: bool,
     settings: Settings,
     settings_dirty: bool,
+    mcp_form: McpForm,
     notice: String,
 }
 
@@ -214,6 +257,7 @@ impl App {
             new_group_open: false,
             selected: None,
             draft: String::new(),
+            draft_mode: None,
             preferences: Preferences::default(),
             saved_preferences: Preferences::default(),
             submitted: None,
@@ -224,10 +268,16 @@ impl App {
             signup_avatar: None,
             signup_palette: None,
             profile_edit: String::new(),
+            profile_pane: None,
+            profile_focus_editor: false,
+            profile_return_focus: None,
+            workspace_jobs_opener: None,
             contact_target: None,
             pending_removal: None,
+            pending_clear: None,
             device_preview: None,
             attachment: None,
+            viewer: image_viewer::Viewer::default(),
             profile_card: None,
             message_details: None,
             reply: None,
@@ -237,6 +287,7 @@ impl App {
             confirm_close: false,
             settings: Settings::default(),
             settings_dirty: false,
+            mcp_form: McpForm::default(),
             notice: String::new(),
         }
     }
@@ -340,6 +391,9 @@ impl App {
     }
 
     fn open_identity(&mut self, identity: Identity) -> Result<()> {
+        self.pending_clear = None;
+        self.viewer.close();
+        image_viewer::reset_cache_scope();
         self.session = Some(Session::new(
             self.profile_root().join("profiles"),
             identity.clone(),
@@ -447,8 +501,10 @@ impl App {
                         if self.draft == draft.text
                             && self.reply == draft.reply
                             && self.attachment == draft.attachment
+                            && self.draft_mode == draft.mode
                         {
                             self.draft.clear();
+                            self.draft_mode = None;
                             self.reply = None;
                             self.attachment = None;
                         }
@@ -995,11 +1051,17 @@ impl App {
                 .get(&Self::draft_key(&selection))
                 .cloned()
                 .unwrap_or_default();
+            self.reply = draft.reply.filter(|(seq, _, _)| {
+                self.view
+                    .as_ref()
+                    .and_then(|view| view.local.hosts.get(&selection.host))
+                    .is_none_or(|link| link.is_visible(selection.room, *seq))
+            });
             self.selected = Some(selection);
             self.draft = draft.text;
+            self.draft_mode = draft.mode;
             self.attachment = draft.attachment;
             self.message_details = None;
-            self.reply = draft.reply;
             self.jump = None;
             self.invite = false;
             self.read_sent = None;
@@ -1024,6 +1086,7 @@ impl App {
             text: self.draft.clone(),
             reply: self.reply.clone(),
             attachment: self.attachment.clone(),
+            mode: self.draft_mode.clone(),
         }
     }
 
@@ -1060,6 +1123,12 @@ impl App {
         match self.page {
             Page::Chats | Page::Archive => self.inbox(ctx),
             page => {
+                if page == Page::Profile {
+                    self.profile_side_panel(ctx);
+                }
+                if page == Page::Agent {
+                    self.workspace_jobs_panel(ctx);
+                }
                 egui::CentralPanel::default()
                     .frame(
                         Frame::new()
@@ -1067,13 +1136,11 @@ impl App {
                             .fill(visual::palette(self.role).base),
                     )
                     .show(ctx, |ui| {
-                        let width = ui.available_width().min(
-                            if matches!(page, Page::Host | Page::Profile) {
-                                690.
-                            } else {
-                                910.
-                            },
-                        );
+                        let width = ui.available_width().min(match page {
+                            Page::Profile => 420.,
+                            Page::Host => 690.,
+                            _ => 910.,
+                        });
                         ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -1233,62 +1300,203 @@ impl App {
         let Some(identity) = self.identity.clone() else {
             return;
         };
-        visual::page_heading(
-            ui,
-            Outline::People,
-            "Profilim",
-            "Hesap görünümü ve kişi kartın",
-        );
-        self.profile_contents(ui, &identity.card);
-        ui.add_space(12.);
+        visual::page_heading(ui, Outline::People, "Profilim", "");
+        if self.profile_contents(ui, &identity.card) {
+            self.toggle_profile_pane(ui.ctx(), ProfilePane::Photo, None);
+        }
+        let name = self
+            .view
+            .as_ref()
+            .and_then(|view| view.local.display_name.clone())
+            .unwrap_or_else(|| identity.card.data.name.clone());
+        ui.add_space(10.);
         visual::profile_section(ui, Outline::People, "Kimlik", |ui| {
-            ui.label(RichText::new("Görünen ad").color(MUTED).size(12.));
-            ui.horizontal(|ui| {
-                let width = (ui.available_width() - 105.).clamp(90., 410.);
-                ui.add_sized(
-                    [width, 34.],
-                    egui::TextEdit::singleline(&mut self.profile_edit)
-                        .hint_text("Görünen adın")
-                        .vertical_align(Align::Center)
-                        .margin(egui::Margin::symmetric(9, 5)),
-                );
-                if ui.add(visual::primary(ui, "Adı kaydet")).clicked() {
-                    self.command(Command::SetDisplayName(self.profile_edit.clone()));
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
+            let edit = visual::profile_action(
+                ui,
+                Outline::Edit,
+                "Görünen adı düzenle",
+                &name,
+                self.profile_pane == Some(ProfilePane::Name),
+            );
+            if edit.clicked() {
+                self.profile_edit.clone_from(&name);
+                self.toggle_profile_pane(ui.ctx(), ProfilePane::Name, Some(edit.id));
+            }
+            if visual::profile_action(
+                ui,
+                Outline::Copy,
+                "Kullanıcı adımı kopyala",
+                &format!("@{}", identity.card.data.handle),
+                false,
+            )
+            .clicked()
+            {
+                ui.ctx()
+                    .copy_text(format!("@{}", identity.card.data.handle));
+                self.notice = "Kullanıcı adı kopyalandı.".into();
+            }
+        });
+        ui.add_space(10.);
+        visual::profile_section(ui, Outline::Link, "Paylaşım", |ui| {
+            if visual::profile_action(
+                ui,
+                Outline::Link,
+                "Bağlantımı paylaş",
+                "Arkadaşlık istekleri için",
+                false,
+            )
+            .clicked()
+            {
+                self.command(Command::ShareContact);
+            }
+            if visual::profile_action(
+                ui,
+                Outline::Copy,
+                "Kişi kartını kopyala",
+                "İmzalı ChatOid kartı",
+                false,
+            )
+            .clicked()
+                && let Ok(code) = pack("card", &identity.card)
+            {
+                ui.ctx().copy_text(code);
+                self.notice = "Kişi kartı kopyalandı.".into();
+            }
+        });
+    }
+
+    fn toggle_profile_pane(
+        &mut self,
+        ctx: &UiContext,
+        pane: ProfilePane,
+        return_focus: Option<egui::Id>,
+    ) {
+        if self.profile_pane == Some(pane) {
+            self.close_profile_pane(ctx);
+            return;
+        }
+        self.profile_pane = Some(pane);
+        self.profile_return_focus = return_focus;
+        self.profile_focus_editor = pane == ProfilePane::Name;
+        ctx.request_repaint();
+    }
+
+    fn close_profile_pane(&mut self, ctx: &UiContext) {
+        self.profile_pane = None;
+        self.profile_focus_editor = false;
+        if let Some(id) = self.profile_return_focus.take() {
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+        ctx.request_repaint();
+    }
+
+    fn profile_side_panel(&mut self, ctx: &UiContext) {
+        let Some(pane) = self.profile_pane else {
+            return;
+        };
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.close_profile_pane(ctx);
+            return;
+        }
+        if right_drawer(
+            ctx,
+            self.role,
+            "profile-editor-dock",
+            pane.icon(),
+            pane.title(),
+            |ui| {
+                self.profile_pane_contents(ui, pane);
+            },
+        ) && self.profile_pane.is_some()
+        {
+            self.close_profile_pane(ctx);
+        }
+    }
+
+    fn profile_pane_contents(&mut self, ui: &mut Ui, pane: ProfilePane) {
+        match pane {
+            ProfilePane::Name => {
+                let Some(identity) = self.identity.as_ref() else {
+                    return;
+                };
+                let name = self
+                    .view
+                    .as_ref()
+                    .and_then(|view| view.local.display_name.clone())
+                    .unwrap_or_else(|| identity.card.data.name.clone());
+                self.edit_profile_name(ui, &name);
+            }
+            ProfilePane::Photo => {
                 #[cfg(windows)]
-                if visual::work_tab(ui, Outline::People, "Profil fotoğrafı seç", false).clicked()
+                if visual::profile_action(ui, Outline::Plus, "Fotoğraf seç", "JPEG veya PNG", false)
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("JPEG / PNG", &["jpg", "jpeg", "png"])
                         .pick_file()
                 {
                     self.command(Command::SetAvatar(Some(path)));
+                    self.close_profile_pane(ui.ctx());
                 }
                 if self
                     .view
                     .as_ref()
                     .and_then(|view| view.local.avatar.as_ref())
                     .is_some_and(|avatar| avatar.data.is_some())
-                    && visual::work_tab(ui, Outline::Cross, "Fotoğrafı kaldır", false).clicked()
+                    && visual::profile_action(
+                        ui,
+                        Outline::Cross,
+                        "Fotoğrafı kaldır",
+                        "Baş harflerimi göster",
+                        false,
+                    )
+                    .clicked()
                 {
                     self.command(Command::SetAvatar(None));
+                    self.close_profile_pane(ui.ctx());
                 }
-            });
-        });
-        ui.add_space(9.);
-        visual::profile_section(ui, Outline::Link, "Paylaşım", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if visual::work_tab(ui, Outline::Link, "Bağlantımı paylaş", true).clicked() {
-                    self.command(Command::ShareContact);
-                }
-                if visual::work_tab(ui, Outline::Copy, "Kişi kartını kopyala", false).clicked()
-                    && let Ok(code) = pack("card", &identity.card)
-                {
-                    ui.ctx().copy_text(code);
-                }
-            });
-        });
+            }
+        }
+    }
+
+    fn edit_profile_name(&mut self, ui: &mut Ui, current: &str) {
+        let edit_id = egui::Id::new("profile-display-name");
+        if std::mem::take(&mut self.profile_focus_editor) {
+            ui.memory_mut(|memory| memory.request_focus(edit_id));
+        }
+        let focused = ui.memory(|memory| memory.has_focus(edit_id));
+        let enter = focused && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let field = ui.add_sized(
+            [ui.available_width(), 36.],
+            egui::TextEdit::singleline(&mut self.profile_edit)
+                .id(edit_id)
+                .hint_text("Görünen ad")
+                .vertical_align(Align::Center)
+                .margin(egui::Margin::symmetric(10, 5)),
+        );
+        let candidate = self.profile_edit.trim();
+        let valid = validate_name(candidate).is_ok();
+        visual::field_rules(
+            ui,
+            &field,
+            !self.profile_edit.is_empty() && !valid,
+            NAME_RULE,
+        );
+        let changed = valid && candidate != current;
+        let (save, cancel) = ui
+            .horizontal_wrapped(|ui| {
+                (
+                    ui.add_enabled(changed, visual::primary(ui, "Adı kaydet"))
+                        .clicked(),
+                    ui.button("Vazgeç").clicked(),
+                )
+            })
+            .inner;
+        if (save || enter) && changed {
+            self.command(Command::SetDisplayName(candidate.to_owned()));
+        }
+        if ((save || enter) && changed) || cancel {
+            self.close_profile_pane(ui.ctx());
+        }
     }
 
     fn open_profile(&mut self, card: Card) {
@@ -1296,7 +1504,7 @@ impl App {
         self.profile_card = Some(card);
     }
 
-    fn profile_contents(&self, ui: &mut Ui, card: &Card) {
+    fn profile_contents(&self, ui: &mut Ui, card: &Card) -> bool {
         let own = card.data.key == self.id();
         let local = self.view.as_ref().map(|view| &view.local);
         let remote = local.and_then(|local| local.profiles.get(&card.data.key));
@@ -1324,40 +1532,64 @@ impl App {
         });
         let agent = card.data.role == Role::Agent;
         let narrow = ui.available_width() < 340.;
+        let mut photo_clicked = false;
         visual::profile_hero(ui, |ui| {
-            ui.horizontal(|ui| {
-                visual::profile_avatar(ui, card, photo, if narrow { 45. } else { 62. });
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(name)
-                                .size(if narrow { 19. } else { 25. })
-                                .strong(),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(name);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(format!("@{}", card.data.handle))
-                                .size(12.)
-                                .color(MUTED),
-                        )
-                        .truncate(),
-                    );
-                    visual::label_icon(
-                        ui,
-                        if agent {
-                            Outline::Agent
+            if own {
+                ui.vertical_centered(|ui| {
+                    photo_clicked = visual::profile_avatar(ui, card, photo, 79.)
+                        .on_hover_text("Fotoğraf seçeneklerini aç")
+                        .clicked();
+                    ui.add_space(3.);
+                    ui.add(egui::Label::new(RichText::new(name).size(25.).strong()).truncate())
+                        .on_hover_text(name);
+                    ui.weak(format!(
+                        "@{} · {}",
+                        card.data.handle,
+                        if agent { "Ajan" } else { "İnsan" }
+                    ));
+                    photo_clicked |= ui
+                        .link(if photo.is_some() {
+                            "Fotoğrafı değiştir"
                         } else {
-                            Outline::People
-                        },
-                        RichText::new(if agent { "Ajan" } else { "İnsan" })
-                            .size(12.)
-                            .color(visual::palette(self.role).accent),
-                    );
+                            "Fotoğraf ekle"
+                        })
+                        .clicked();
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    visual::profile_avatar(ui, card, photo, if narrow { 45. } else { 62. });
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(name)
+                                    .size(if narrow { 19. } else { 25. })
+                                    .strong(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(name);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("@{}", card.data.handle))
+                                    .size(12.)
+                                    .color(MUTED),
+                            )
+                            .truncate(),
+                        );
+                        visual::label_icon(
+                            ui,
+                            if agent {
+                                Outline::Agent
+                            } else {
+                                Outline::People
+                            },
+                            RichText::new(if agent { "Ajan" } else { "İnsan" })
+                                .size(12.)
+                                .color(visual::palette(self.role).accent),
+                        );
+                    });
+                });
+            }
         });
         if agent {
             let profile = if own {
@@ -1404,6 +1636,7 @@ impl App {
                 ui.ctx().copy_text(code);
             }
         }
+        photo_clicked
     }
 
     fn inbox(&mut self, ctx: &UiContext) {
@@ -1413,55 +1646,54 @@ impl App {
             .view
             .as_ref()
             .map(|view| {
-                let mut rows: Vec<_> =
-                    view.local
-                        .hosts
-                        .iter()
-                        .flat_map(|(pin, host)| {
-                            host.rooms
-                                .iter()
-                                .filter(|room| host.archived.contains(&room.id) == archive)
-                                .map(|room| {
-                                    let unread = host.unread(room.id, self.id());
-                                    let seen = *host.seen.get(&room.id).unwrap_or(&0);
-                                    let targeted =
-                                        host.messages.range((seen + 1)..).any(|(_, message)| {
-                                            message.room == room.id
-                                                && message.author.data.key != self.id()
-                                                && (message.reply.as_ref().is_some_and(|q| {
-                                                    q.author.data.key == self.id()
-                                                }) || self.identity.as_ref().is_some_and(|i| {
-                                                    mentions(&message.text, &i.card.data.handle)
-                                                }))
-                                        });
-                                    (
-                                        Selection {
-                                            host: pin.clone(),
-                                            room: room.id,
-                                        },
-                                        room.name.clone(),
-                                        unread,
-                                        targeted,
-                                        host.last(room.id).map(|m| {
-                                            let body = m
-                                                .attachment
-                                                .as_ref()
-                                                .filter(|_| m.text.is_empty())
-                                                .map_or_else(
-                                                    || m.text.clone(),
-                                                    |file| format!("Dosya · {}", file.name),
-                                                );
-                                            let preview = if room.group {
-                                                format!("{} · {body}", m.author.data.name)
-                                            } else {
-                                                body
-                                            };
-                                            (m.sent_at, preview)
-                                        }),
-                                    )
-                                })
-                        })
-                        .collect();
+                let mut rows: Vec<_> = view
+                    .local
+                    .hosts
+                    .iter()
+                    .flat_map(|(pin, host)| {
+                        host.rooms
+                            .iter()
+                            .filter(|room| host.archived.contains(&room.id) == archive)
+                            .map(|room| {
+                                let unread = host.unread(room.id, self.id());
+                                let targeted =
+                                    host.unread_messages(room.id, self.id()).any(|message| {
+                                        message
+                                            .reply
+                                            .as_ref()
+                                            .is_some_and(|q| q.author.data.key == self.id())
+                                            || self.identity.as_ref().is_some_and(|i| {
+                                                mentions(&message.text, &i.card.data.handle)
+                                            })
+                                    });
+                                (
+                                    Selection {
+                                        host: pin.clone(),
+                                        room: room.id,
+                                    },
+                                    room.name.clone(),
+                                    unread,
+                                    targeted,
+                                    host.last(room.id).map(|m| {
+                                        let body = m
+                                            .attachment
+                                            .as_ref()
+                                            .filter(|_| m.text.is_empty())
+                                            .map_or_else(
+                                                || m.text.clone(),
+                                                |file| format!("Dosya · {}", file.name),
+                                            );
+                                        let preview = if room.group {
+                                            format!("{} · {body}", m.author.data.name)
+                                        } else {
+                                            body
+                                        };
+                                        (m.sent_at, preview)
+                                    }),
+                                )
+                            })
+                    })
+                    .collect();
                 rows.sort_by_key(|(_, _, _, _, message)| {
                     std::cmp::Reverse(message.as_ref().map(|m| m.0).unwrap_or(0))
                 });
@@ -1556,6 +1788,7 @@ impl App {
                 ui.separator();
                 ScrollArea::vertical().show(ui, |ui| {
                     for (selection, name, unread, targeted, last) in rows {
+                        let has_history = last.is_some();
                         let (time, preview) = last
                             .map(|(t, p)| (time(t), short(&p, 36)))
                             .unwrap_or_default();
@@ -1571,6 +1804,13 @@ impl App {
                         row.context_menu(|ui| {
                             if ui.button("Sohbeti aç").clicked() {
                                 self.choose(selection.clone());
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(has_history, egui::Button::new("Sohbeti temizle"))
+                                .clicked()
+                            {
+                                self.pending_clear = Some((selection.clone(), name.clone()));
                                 ui.close();
                             }
                             if ui
@@ -1632,11 +1872,7 @@ impl App {
     }
 
     fn conversation(&mut self, ui: &mut Ui, s: Selection, link: Link, room: Room) {
-        let messages: Vec<_> = link
-            .messages
-            .values()
-            .filter(|message| message.room == room.id)
-            .collect();
+        let messages: Vec<_> = link.visible_messages(room.id).collect();
         let owner = room.owner == self.id();
         ui.horizontal_wrapped(|ui| {
             if !room.group
@@ -1701,9 +1937,17 @@ impl App {
                         ui.close();
                     }
                     if let Some(first) = messages.first()
+                        && first.seq > link.cleared_through(room.id) + 1
                         && ui.button("Önceki mesajlar").clicked()
                     {
                         self.command(Command::History(s.clone(), first.seq));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!messages.is_empty(), egui::Button::new("Sohbeti temizle"))
+                        .clicked()
+                    {
+                        self.pending_clear = Some((s.clone(), room.name.clone()));
                         ui.close();
                     }
                 });
@@ -1823,6 +2067,15 @@ impl App {
             .stick_to_bottom(bottom)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 5.;
+                if messages.is_empty()
+                    && link.cleared_through(room.id) > 0
+                    && !link.queue.iter().any(|item| item.draft.room == room.id)
+                {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(16.);
+                        ui.weak("Sohbet temizlendi. Yeni mesajlar burada görünecek.");
+                    });
+                }
                 let mut day = None;
                 let mut previous = None;
                 for message in messages {
@@ -1860,10 +2113,41 @@ impl App {
                                 } else {
                                     ui.add_space(28.);
                                 }
-                                self.message(ui, message, &s, &room, first, &link.receipts);
+                                self.message(ui, message, &s, &room, first, &link);
                             });
                         } else {
-                            self.message(ui, message, &s, &room, false, &link.receipts);
+                            self.message(ui, message, &s, &room, false, &link);
+                        }
+                        if link.online
+                            && room.active
+                            && !room.closed
+                            && message.author.data.key == self.id()
+                            && let Some(activity) = link.task_activity.iter().find(|activity| {
+                                activity.room == room.id && activity.source == message.seq
+                            })
+                        {
+                            let status = match activity.phase {
+                                crate::protocol::TaskPhase::Pending => "Ajan onayı bekleniyor",
+                                crate::protocol::TaskPhase::Running => "Ajan çalışıyor",
+                                crate::protocol::TaskPhase::WaitingApproval => {
+                                    "Ajan yerel eylem onayı bekliyor"
+                                }
+                                crate::protocol::TaskPhase::WaitingAnswer => {
+                                    "Ajan yanıtını bekliyor"
+                                }
+                                crate::protocol::TaskPhase::Stopping => "Görev durduruluyor",
+                                crate::protocol::TaskPhase::Complete => "Görev tamamlandı",
+                                crate::protocol::TaskPhase::Rejected => "Görev reddedildi",
+                                crate::protocol::TaskPhase::Cancelled => "Görev durduruldu",
+                                crate::protocol::TaskPhase::Failed => "Görev tamamlanamadı",
+                            };
+                            let text = activity.plan.map_or_else(
+                                || status.to_owned(),
+                                |[done, total]| format!("{status} · {done}/{total} adım"),
+                            );
+                            ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                                ui.label(RichText::new(text).size(12.).color(MUTED));
+                            });
                         }
                     });
                     previous = Some(message);
@@ -1881,7 +2165,7 @@ impl App {
                         if item.error.is_some() { 94. } else { 0. },
                         0,
                     );
-                    visual::bubble_lane(ui, true, &size, false, |ui| {
+                    let (pending_response, _) = visual::bubble_lane(ui, true, &size, false, |ui| {
                         if let Some(path) = &item.binary {
                             let name = path
                                 .file_name()
@@ -1925,6 +2209,12 @@ impl App {
                             self.restore_failed(&link, item);
                         }
                     });
+                    pending_response.context_menu(|ui| {
+                        if ui.button("Sil · gönderimi geri al").clicked() {
+                            self.command(Command::CancelSend(s.clone(), item.draft.id));
+                            ui.close();
+                        }
+                    });
                 }
             });
     }
@@ -1932,7 +2222,15 @@ impl App {
     fn restore_failed(&mut self, link: &Link, item: &crate::session::Pending) {
         self.draft = item.draft.text.clone();
         self.attachment = item.binary.clone();
+        self.draft_mode = item
+            .draft
+            .mode
+            .clone()
+            .filter(|mode| mode != &MessageMode::Plain);
         self.reply = item.draft.reply.and_then(|id| {
+            if !link.is_visible(item.draft.room, id) {
+                return None;
+            }
             let source = link.messages.get(&id)?;
             Some((
                 id,
@@ -2054,13 +2352,86 @@ impl App {
                         }
                     });
                 }
-                let enter = ui.memory(|memory| memory.has_focus(draft_id))
+                let focused = ui.memory(|memory| memory.has_focus(draft_id));
+                if focused {
+                    ui.input_mut(|input| {
+                        input.events.retain(|event| !matches!(event, egui::Event::Key {
+                            key: egui::Key::Enter, repeat: true, modifiers, ..
+                        } if !modifiers.shift));
+                    });
+                }
+                let cursor_char = egui::TextEdit::load_state(ui.ctx(), draft_id)
+                    .and_then(|state| state.cursor.char_range())
+                    .map(|range| range.primary.index)
+                    .unwrap_or_else(|| self.draft.chars().count());
+                let slash_token = slash_command_token(&self.draft, cursor_char);
+                let suggestions = slash_token
+                    .as_ref()
+                    .map(|(_, _, query)| slash_command_suggestions(query))
+                    .unwrap_or_default();
+                let selection_id = draft_id.with("slash-selection");
+                let dismissed_id = draft_id.with("slash-dismissed");
+                let dismissed = ui.ctx().data(|data| {
+                    data.get_temp::<String>(dismissed_id)
+                        .is_some_and(|draft| draft == self.draft)
+                });
+                let suggestions_open = focused && !suggestions.is_empty() && !dismissed;
+                let mut selected = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<usize>(selection_id).unwrap_or(0))
+                    .min(suggestions.len().saturating_sub(1));
+                let mut completion_enter = false;
+                let management = is_automation_management(&self.draft);
+                let activation = (!management).then(|| leading_slash_mode(&self.draft).or_else(|| {
+                    slash_token.as_ref().and_then(|(start, end, query)| {
+                        slash_mode(query).or_else(|| {
+                            suggestions_open.then(|| suggestions[selected].command).and_then(slash_mode)
+                        }).map(|mode| (*start, *end, mode))
+                    })
+                })).flatten();
+                let mode_enter=focused && activation.is_some() && !ui.input(|input|input.modifiers.shift)
+                    && ui.input_mut(|input|input.consume_key(egui::Modifiers::NONE,egui::Key::Enter));
+                if mode_enter && let Some((start,end,mode))=activation {
+                    let (draft,caret)=consume_mode_slash_token(&self.draft,start,end);
+                    self.draft=draft;self.draft_mode=Some(mode);set_composer_cursor(ui.ctx(),draft_id,caret);
+                }
+                if suggestions_open {
+                    if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                        selected = (selected + 1) % suggestions.len();
+                    }
+                    if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                        selected = selected.checked_sub(1).unwrap_or(suggestions.len() - 1);
+                    }
+                    completion_enter = !management && !mode_enter && ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    });
+                    if completion_enter {
+                        if let Some((start, end, _)) = slash_token {
+                            let (draft, caret) = replace_slash_token(
+                                &self.draft,
+                                start,
+                                end,
+                                suggestions[selected].command,
+                            );
+                            self.draft = draft;
+                            set_composer_cursor(ui.ctx(), draft_id, caret);
+                        }
+                        ui.memory_mut(|memory| memory.request_focus(draft_id));
+                    } else if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    }) {
+                        ui.ctx().data_mut(|data| data.insert_temp(dismissed_id, self.draft.clone()));
+                    }
+                }
+                ui.ctx().data_mut(|data| data.insert_temp(selection_id, selected));
+                let enter = !mode_enter && !completion_enter && ui.memory(|memory| memory.has_focus(draft_id))
                     && ui.input_mut(|input| {
                         !input.modifiers.shift
                             && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                     });
                 let (field, button) = ui
                     .horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.;
                         visual::composer_popup(ui, Outline::Attachment, "Dosya ekle", |ui| {
                             #[cfg(windows)]
                             if ui
@@ -2091,10 +2462,35 @@ impl App {
                                 }
                             });
                         });
-                        let width = (ui.available_width() - 49.).max(74.);
+                        ui.menu_button("Komutlar", |ui| {
+                            ui.set_min_width(210.);
+                            for command in ["/loop", "/goal"] {
+                                if ui.button(format!("{command} · komutu ekle")).clicked() {
+                                    let (draft, caret) = slash_token
+                                        .as_ref()
+                                        .map(|(start, end, _)| {
+                                            replace_slash_token(&self.draft, *start, *end, command)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            let mut draft = self.draft.clone();
+                                            if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
+                                                draft.push(' ');
+                                            }
+                                            draft.push_str(command);
+                                            let caret = draft.chars().count();
+                                            (draft, caret)
+                                        });
+                                    self.draft = draft;
+                                    let caret=caret.saturating_sub(usize::from(self.draft.chars().nth(caret.saturating_sub(1))==Some(' ')));
+                                    set_composer_cursor(ui.ctx(), draft_id, caret);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        let width = (ui.available_width() - 42.).max(40.);
                         let field = ui
                             .allocate_ui_with_layout(
-                                egui::vec2(width, 0.),
+                                egui::vec2(width, 36.),
                                 Layout::top_down(Align::Min),
                                 |ui| {
                                     ui.set_width(width);
@@ -2106,9 +2502,7 @@ impl App {
                                                 [width, 36.],
                                                 egui::TextEdit::multiline(&mut self.draft)
                                                     .id(draft_id)
-                                                    .hint_text(
-                                                        RichText::new("Mesaj yaz…").color(MUTED),
-                                                    )
+                                                    .hint_text(RichText::new("Mesaj yaz…").color(MUTED))
                                                     .desired_rows(1)
                                                     .margin(egui::Margin::symmetric(10, 8)),
                                             )
@@ -2126,13 +2520,89 @@ impl App {
                         (field, send)
                     })
                     .inner;
+                if completion_enter || mode_enter {
+                    field.request_focus();
+                }
+                let mut clicked_suggestion = false;
+                if suggestions_open && !completion_enter {
+                    egui::Area::new(draft_id.with("slash-popup"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(field.rect.left(), field.rect.top() - 108.))
+                        .show(ui.ctx(), |ui| {
+                            Frame::popup(ui.style())
+                                .fill(colors.panel)
+                                .stroke(egui::Stroke::new(1_f32, colors.border))
+                                .corner_radius(10)
+                                .inner_margin(5.)
+                                .show(ui, |ui| {
+                                    ui.set_width(280.);
+                                    for (index, suggestion) in suggestions.iter().enumerate() {
+                                        if visual::slash_command_suggestion(
+                                            ui,
+                                            suggestion.icon,
+                                            suggestion.command,
+                                            suggestion.description,
+                                            index == selected,
+                                        ).clicked() {
+                                            if let Some((start, end, _)) = slash_token {
+                                                let (draft, caret) = replace_slash_token(
+                                                    &self.draft,
+                                                    start,
+                                                    end,
+                                                    suggestion.command,
+                                                );
+                                                self.draft = draft;
+                                                set_composer_cursor(ui.ctx(), draft_id, caret);
+                                            }
+                                            clicked_suggestion = true;
+                                        }
+                                    }
+                                });
+                        });
+                }
+                if clicked_suggestion {
+                    field.request_focus();
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(mode) = self.draft_mode.clone() {
+                        let (icon, label) = match mode {
+                            MessageMode::Goal => (Outline::Goal, "Hedef"),
+                            MessageMode::Loop { .. } => (Outline::Loop, "Döngü"),
+                            MessageMode::Plain => (Outline::Chat, "Düz metin"),
+                        };
+                        visual::label_icon(ui, icon, RichText::new(label).color(colors.accent));
+                        if let MessageMode::Loop { interval_seconds } = mode {
+                            egui::ComboBox::from_id_salt(draft_id.with("loop-interval"))
+                                .selected_text(loop_interval_label(interval_seconds))
+                                .show_ui(ui, |ui| {
+                                    for (seconds, option) in [
+                                        (10, "10 sn"),
+                                        (30 * 60, "30 dk"),
+                                        (60 * 60, "1 saat"),
+                                        (24 * 60 * 60, "1 gün"),
+                                    ] {
+                                        if ui.selectable_label(interval_seconds == seconds, option).clicked() {
+                                            self.draft_mode = Some(MessageMode::Loop { interval_seconds: seconds });
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                        }
+                        if visual::composer_button(ui, Outline::Cross, "Modu kaldır", false).clicked() {
+                            self.draft_mode = None;
+                        }
+                    }
+                });
                 if (enter || button) && (!self.draft.trim().is_empty() || self.attachment.is_some())
                 {
                     let draft = self.current_draft();
                     if self.submitted.as_ref().is_none_or(|(_, _, previous)| previous != &draft) {
                         let id = uuid::Uuid::new_v4();
-                        self.command(Command::SendDraft(selection.clone(), id, draft.text.clone(),
-                            draft.reply.as_ref().map(|quote| quote.0), draft.attachment.clone()));
+                        let wire_mode = draft.mode.clone().or_else(|| {
+                            (crate::session::automation::contains_command(&draft.text) && !management).then_some(MessageMode::Plain)
+                        });
+                        self.command(Command::SendModeDraft(selection.clone(), id, draft.text.clone(),
+                            draft.reply.as_ref().map(|quote| quote.0), draft.attachment.clone(), wire_mode));
                         self.submitted = Some((selection.clone(), id, draft));
                         field.request_focus();
                     }
@@ -2147,13 +2617,17 @@ impl App {
         selection: &Selection,
         room: &Room,
         show_author: bool,
-        receipts: &[Receipt],
+        link: &Link,
     ) {
+        if message.withdrawn {
+            ui.label(RichText::new("Bu mesaj geri alındı").italics().color(MUTED));
+            return;
+        }
         let colors = visual::palette(self.role);
         let mine = message.author.data.key == self.id();
         let author = show_author.then_some(message.author.data.name.as_str());
         let stamp = time(message.sent_at);
-        let status = mine.then(|| delivery_status(message, receipts));
+        let status = mine.then(|| delivery_status(message, &link.receipts));
         let checks = status.map_or(0, DeliveryStatus::checks);
         let title = status.map_or_else(
             || calendar_date(message.sent_at),
@@ -2167,6 +2641,7 @@ impl App {
         let quote = message
             .reply
             .as_ref()
+            .filter(|quote| link.is_visible(room.id, quote.id))
             .map(|quote| format!("{} · {}", quote.author.data.name, short(&quote.text, 88)));
         let extra = [
             author.map_or(0., |author| {
@@ -2236,29 +2711,58 @@ impl App {
                     }
                 }
                 if let Some(file) = &message.attachment {
+                    let mut open = false;
                     if let Some(preview) = &file.preview {
-                        visual::attachment_preview(ui, preview, (&selection.host, message.seq));
+                        open |=
+                            visual::attachment_preview(ui, preview, (&selection.host, message.seq))
+                                .is_some_and(|response| response.clicked());
                     }
+                    let is_image = file.preview.is_some()
+                        || [".jpg", ".jpeg", ".png"]
+                            .iter()
+                            .any(|suffix| file.name.to_lowercase().ends_with(suffix));
                     let label = format!("{} · {}", short(&file.name, 26), file_size(file.bytes));
-                    #[cfg(windows)]
                     if ui
-                        .horizontal(|ui| {
-                            visual::small_icon(ui, Outline::Attachment);
-                            ui.add_sized(
-                                [ui.available_width(), 27.],
-                                egui::Button::new(&label).truncate(),
-                            )
+                        .button(label)
+                        .on_hover_text(if is_image {
+                            "Fotoğrafı aç"
+                        } else {
+                            "Dosyayı kaydet"
                         })
-                        .inner
-                        .on_hover_text(format!("{} dosyasını kaydet", file.name))
                         .clicked()
-                        && let Some(path) =
-                            rfd::FileDialog::new().set_file_name(&file.name).save_file()
                     {
-                        self.command(Command::Download(selection.clone(), message.seq, path));
+                        if is_image {
+                            open = true;
+                        } else {
+                            #[cfg(windows)]
+                            if let Some(path) =
+                                rfd::FileDialog::new().set_file_name(&file.name).save_file()
+                            {
+                                self.command(Command::Download(
+                                    selection.clone(),
+                                    message.seq,
+                                    path,
+                                ));
+                            }
+                        }
                     }
-                    #[cfg(not(windows))]
-                    visual::label_icon(ui, Outline::Attachment, RichText::new(label));
+                    if open && let Some(root) = self.preferences_root() {
+                        let path = image_viewer::cache_path(&root, &selection.host, message.seq);
+                        let prepared = path.parent().map(std::fs::create_dir_all).transpose();
+                        match prepared {
+                            Ok(_) => {
+                                if !path.is_file() {
+                                    self.command(Command::Download(
+                                        selection.clone(),
+                                        message.seq,
+                                        path.clone(),
+                                    ));
+                                }
+                                self.viewer.open(file.name.clone(), path);
+                            }
+                            Err(error) => self.notice = format!("Fotoğraf açılamadı: {error}"),
+                        }
+                    }
                 }
                 let (job, tags) = mention_body(&message.text, room, colors.accent);
                 if tags.is_empty() {
@@ -2289,6 +2793,17 @@ impl App {
                     self.command(Command::Import(code));
                     self.page = Page::Contacts;
                 }
+                if message.author.data.role == Role::Agent {
+                    for url in message_web_links(&message.text) {
+                        let label = format!(
+                            "{}{}",
+                            url.host_str().unwrap_or_default(),
+                            url.path().trim_end_matches('/')
+                        );
+                        ui.hyperlink_to(short(&label, 55), url.as_str())
+                            .on_hover_text(url.as_str());
+                    }
+                }
             });
         let menu_click = ui
             .input(|input| {
@@ -2306,6 +2821,83 @@ impl App {
             .at_pointer_fixed()
             .open_memory(menu_click.then_some(egui::SetOpenCommand::Bool(true)))
             .show(|ui| {
+                if mine && message.undo_until_ms > 0 {
+                    let allowed = crate::protocol::now_ms() <= message.undo_until_ms;
+                    if ui
+                        .add_enabled(allowed, egui::Button::new("Sil · geri al"))
+                        .on_hover_text("İlk 0,5 saniye içinde herkes için geri al")
+                        .clicked()
+                    {
+                        self.command(Command::WithdrawMessage(selection.clone(), message.seq));
+                        ui.close();
+                    }
+                }
+                let goal_start = mine
+                    && !room.group
+                    && room.active
+                    && !room.closed
+                    && room
+                        .members
+                        .iter()
+                        .any(|member| member.data.role == Role::Agent)
+                    && (message.mode == Some(MessageMode::Goal)
+                        || message
+                            .text
+                            .trim()
+                            .split_once(char::is_whitespace)
+                            .is_some_and(|(verb, remainder)| {
+                                verb == "/goal" && !remainder.trim().is_empty()
+                            }));
+                let workspace_start = goal_start
+                    || (mine
+                        && !room.group
+                        && room.active
+                        && !room.closed
+                        && room
+                            .members
+                            .iter()
+                            .any(|member| member.data.role == Role::Agent)
+                        && self
+                            .view
+                            .as_ref()
+                            .and_then(|view| view.local.hosts.get(&selection.host))
+                            .is_some_and(|link| {
+                                link.task_activity.iter().any(|activity| {
+                                    activity.room == message.room && activity.source == message.seq
+                                })
+                            }));
+                if workspace_start && ui.button("Görevi yönlendir").clicked() {
+                    self.reply = Some((
+                        message.seq,
+                        message.author.data.name.clone(),
+                        short(&message.text, 100),
+                    ));
+                    let id = egui::Id::new(("conversation-composer", selection.room)).with("input");
+                    self.prefill_workspace_command(ui.ctx(), id, "/yönlendir ", "/yonlendir ");
+                    ui.close();
+                }
+                if workspace_start {
+                    let commands = if goal_start {
+                        [
+                            ("Görev durumu", "/goal status"),
+                            ("Görevi durdur", "/goal stop"),
+                        ]
+                    } else {
+                        [("Görev durumu", "/durum"), ("Görevi durdur", "/durdur")]
+                    };
+                    for (label, verb) in commands {
+                        if ui.button(label).clicked() {
+                            self.command(Command::SendDraft(
+                                selection.clone(),
+                                uuid::Uuid::new_v4(),
+                                verb.into(),
+                                Some(message.seq),
+                                None,
+                            ));
+                            ui.close();
+                        }
+                    }
+                }
                 if ui.button("Yanıtla").clicked() {
                     self.reply = Some((
                         message.seq,
@@ -2354,6 +2946,26 @@ impl App {
             bubble.scroll_to_me(Some(Align::Center));
             self.jump = None;
         }
+    }
+
+    fn prefill_workspace_command(
+        &mut self,
+        ctx: &UiContext,
+        id: egui::Id,
+        command: &str,
+        alias: &str,
+    ) {
+        if !self.draft.starts_with(command) && !self.draft.starts_with(alias) {
+            self.draft.insert_str(0, command);
+        }
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(self.draft.chars().count()),
+            )));
+        state.store(ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
     }
 
     fn contacts(&mut self, ui: &mut Ui) {
@@ -2643,6 +3255,36 @@ impl App {
     }
 
     fn chat_dialogs(&mut self, ctx: &UiContext) {
+        if let Some((selection, name)) = self.pending_clear.clone() {
+            let modal = egui::Modal::new(egui::Id::new("clear-chat")).show(ctx, |ui| {
+                ui.set_max_width(370.);
+                ui.heading("Sohbeti temizle");
+                ui.label(format!(
+                    "{} sohbetindeki mevcut mesajlar yalnızca bu hesabın görünümünden kalkacak.",
+                    name
+                ));
+                ui.add_space(8.);
+                ui.horizontal(|ui| {
+                    if ui.button("Vazgeç").clicked() {
+                        self.pending_clear = None;
+                    }
+                    if ui.add(visual::primary(ui, "Temizle")).clicked() {
+                        if self.selected.as_ref() == Some(&selection) {
+                            self.message_details = None;
+                            self.reply = None;
+                            self.jump = None;
+                            self.viewer.close();
+                            self.save_preferences();
+                        }
+                        self.command(Command::ClearChat(selection));
+                        self.pending_clear = None;
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.pending_clear = None;
+            }
+        }
         if let Some(card) = self.profile_card.clone() {
             let mut open = true;
             if ctx.content_rect().width() >= 950. {
@@ -3021,7 +3663,92 @@ impl App {
             .as_ref()
             .map(|v| v.local.clone())
             .unwrap_or_default();
-        visual::label_icon(ui, Outline::Agent, RichText::new("Ajan kimliği").heading());
+        if local.operator.is_none() || !self.settings.workspace_jobs {
+            visual::profile_section(ui, Outline::Agent, "Codex görevlerini hazırla", |ui| {
+                ui.label("Operatör eşleştikten sonra bire bir mesajlar yerel Codex'te çalışır. İsteğe bağlı olarak ayrı bir klasör ve her istek için onay ayarlayabilirsin.");
+                visual::status(
+                    ui,
+                    if local.operator.is_some() {
+                        "Operatör eşleşti"
+                    } else {
+                        "Operatör seçilmedi"
+                    },
+                    local.operator.is_some(),
+                );
+                if local.operator.is_none() {
+                    let me = self.id().to_owned();
+                    for card in local.contacts.values().filter(|card| {
+                        card.data.role == Role::Human && local.friend(&me, &card.data.key).is_some()
+                    }) {
+                        if ui
+                            .button(format!("{} · Operatör olarak eşleştir", card.data.name))
+                            .clicked()
+                            && let Ok(code) = pack("card", card)
+                        {
+                            self.command(Command::Pair(code));
+                        }
+                    }
+                }
+                visual::status(
+                    ui,
+                    if self.settings.workspace.is_empty() {
+                        "Varsayılan özel çalışma alanı kullanılacak"
+                    } else {
+                        "Çalışma klasörü seçildi"
+                    },
+                    true,
+                );
+                #[cfg(windows)]
+                if ui.button("Çalışma klasörü seç").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.settings.workspace = path.to_string_lossy().into_owned();
+                    self.settings_dirty = true;
+                }
+                if ui.button("İsteğe bağlı ayrı görev hesabı ekle").clicked() {
+                    self.command(Command::SignInTaskCodex(self.settings.codex.clone()));
+                }
+                if ui
+                    .add_enabled(
+                        local.operator.is_some(),
+                        egui::Button::new("Görev ayarlarını kaydet ve etkinleştir"),
+                    )
+                    .clicked()
+                {
+                    self.settings.workspace_jobs = true;
+                    self.command(Command::Settings(self.settings.clone()));
+                    self.settings_dirty = false;
+                }
+                ui.weak("Eşleşmiş operatörün bire bir istekleri Codex'te çalışır. Ayrı onay seçeneği ve çalışma klasörü aşağıdan ayarlanabilir.");
+            });
+            ui.add_space(12.);
+        }
+        ui.horizontal_wrapped(|ui| {
+            visual::label_icon(ui, Outline::Agent, RichText::new("Ajan kimliği").heading());
+            let pending = local
+                .jobs
+                .iter()
+                .filter(|job| matches!(job.status, crate::session::WorkspaceJobStatus::Pending))
+                .count();
+            let label = if let Some(approval) = &local.task_approval {
+                if approval.file {
+                    "Dosya onayı bekliyor"
+                } else {
+                    "Pencere onayı bekliyor"
+                }
+                .into()
+            } else if pending > 0 {
+                format!("Codex görevleri ({pending})")
+            } else {
+                "Codex görevleri".into()
+            };
+            let open = self.workspace_jobs_opener.is_some();
+            let button = visual::work_tab(ui, Outline::Chat, &label, open);
+            if button.clicked() {
+                self.workspace_jobs_opener = (!open).then_some(button.id);
+                ui.ctx().request_repaint();
+            }
+        });
         if let Some(identity) = self.identity.as_ref() {
             ui.label(format!(
                 "{}  @{}",
@@ -3093,13 +3820,101 @@ impl App {
             Outline::Archive,
             RichText::new("Çalışma klasörü").heading(),
         );
+        if visual::work_tab(
+            ui,
+            Outline::Lock,
+            "İsteğe bağlı ayrı görev hesabı ekle",
+            false,
+        )
+        .clicked()
+        {
+            self.command(Command::SignInTaskCodex(self.settings.codex.clone()));
+        }
         self.settings_dirty |= field(
             ui,
-            "Salt okunur klasör",
+            "Çalışma klasörü yolu",
             &mut self.settings.workspace,
             "Klasörün tam yolu",
         );
+        #[cfg(windows)]
+        if visual::work_tab(ui, Outline::Archive, "Çalışma klasörü seç", false).clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            self.settings.workspace = path.to_string_lossy().into_owned();
+            self.settings_dirty = true;
+        }
+        self.settings_dirty |= ui
+            .checkbox(
+                &mut self.settings.workspace_jobs,
+                "Onaylı Codex çalışma görevlerine izin ver",
+            )
+            .on_hover_text("Eşleşmiş operatörün bire bir istekleri yerel Codex'te çalışır.")
+            .changed();
+        self.settings_dirty |= ui.checkbox(
+            &mut self.settings.manual_task_approval,
+            "Her istek için ayrıca çalıştırma onayı iste",
+        ).on_hover_text("Kapalıyken eşleşmiş operatörün normal istekleri otomatik başlar. Açıkken her istek için yerel onay gerekir.").changed();
+        let access = self.settings.task_access;
+        task_access_picker(ui, &mut self.settings.task_access);
+        self.settings_dirty |= access != self.settings.task_access;
+        if self.settings.task_access == TaskAccess::Full {
+            ui.weak("Tam erişimde her görev ajan cihazında çalıştırma onayı bekler.");
+        }
+        ui.push_id("agent-default-task-model", |ui| {
+            let previous = self.settings.task_model.clone();
+            task_model_picker(
+                ui,
+                &local.task_models,
+                "Codex varsayılanı",
+                &mut self.settings.task_model,
+            );
+            self.settings_dirty |= previous != self.settings.task_model;
+            if ui
+                .button(if local.task_models.is_empty() {
+                    "Codex modellerini yükle"
+                } else {
+                    "Model listesini yenile"
+                })
+                .clicked()
+            {
+                self.command(Command::LoadTaskModels);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Görev süre sınırı");
+            self.settings_dirty |= ui
+                .add(
+                    egui::DragValue::new(&mut self.settings.task_timeout_minutes)
+                        .range(1..=1440)
+                        .suffix(" dakika"),
+                )
+                .on_hover_text(
+                    "Yeni başlatılan görevlere uygulanır. Durdur düğmesi her zaman kullanılabilir.",
+                )
+                .changed();
+        });
         ui.weak("Grup incelemelerinin sonucu gruptaki üyelerle paylaşılır.");
+        ui.collapsing("Ek skill klasörleri", |ui| {
+            ui.weak("Kurulu Codex becerileri otomatik bulunur. Başka bir klasör ekleyebilir, görev panelinden listeyi yenileyebilirsin.");
+            let mut remove = None;
+            for (index, path) in self.settings.skill_roots.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(path.display().to_string());
+                    if ui.small_button("Kaldır").clicked() { remove = Some(index); }
+                });
+            }
+            if let Some(index) = remove {
+                self.settings.skill_roots.remove(index);
+                self.settings_dirty = true;
+            }
+            if ui.add_enabled(self.settings.skill_roots.len() < 8, egui::Button::new("Skill klasörü ekle")).clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title("Skill klasörünü veya skill'leri içeren klasörü seç").pick_folder()
+                && !self.settings.skill_roots.contains(&path)
+            {
+                self.settings.skill_roots.push(path);
+                self.settings_dirty = true;
+            }
+        });
         for (pin, link) in &local.hosts {
             for room in link.rooms.iter().filter(|room| room.active && !room.closed) {
                 ui.collapsing(&room.name, |ui| {
@@ -3158,6 +3973,658 @@ impl App {
             self.command(Command::Settings(self.settings.clone()));
         }
     }
+
+    fn workspace_jobs_panel(&mut self, ctx: &UiContext) {
+        let Some(opener) = self.workspace_jobs_opener else {
+            return;
+        };
+        let escape =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if escape
+            || right_drawer(
+                ctx,
+                self.role,
+                "workspace-jobs-dock",
+                Outline::Agent,
+                "Codex görevleri",
+                |ui| {
+                    let local = self
+                        .view
+                        .as_ref()
+                        .map(|view| view.local.clone())
+                        .unwrap_or_default();
+                    self.workspace_jobs(ui, &local);
+                },
+            )
+        {
+            self.workspace_jobs_opener = None;
+            ctx.memory_mut(|memory| memory.request_focus(opener));
+            ctx.request_repaint();
+        }
+    }
+
+    fn workspace_jobs(&mut self, ui: &mut Ui, local: &crate::session::Local) {
+        use crate::session::{WorkspaceDecision, WorkspaceJobStatus};
+        if !local.settings.workspace_jobs && local.jobs.is_empty() {
+            ui.weak("Ajan ayarlarından Codex görevlerini etkinleştir.");
+            return;
+        }
+        if local.jobs.is_empty() {
+            ui.weak("Eşleşmiş operatör bire bir isteklerini gönderebilir; /goal kalıcı hedefleri izler.");
+        }
+        egui::CollapsingHeader::new("MCP bağlantıları").show(ui, |ui| {
+            if ui
+                .button("Bağlantıları ve araçları listele")
+                .on_hover_text("Ajanın Codex görev profiline tanımlı MCP sunucularına bağlanır.")
+                .clicked()
+            {
+                self.command(Command::LoadTaskMcp);
+            }
+            ui.weak("Bu liste ajan profilindeki Codex bağlantılarını gösterir.");
+            self.mcp_setup(ui);
+            if let Some(connections) = &local.task_mcp {
+                if connections.is_empty() {
+                    ui.weak("Bu görev profilinde MCP bağlantısı bulunamadı.");
+                }
+                for connection in connections {
+                    egui::CollapsingHeader::new(format!(
+                        "{} · {} araç",
+                        connection.name,
+                        connection.tools.len()
+                    ))
+                    .id_salt(&connection.name)
+                    .show(ui, |ui| {
+                        ui.weak(format!("Kimlik doğrulama · {}", connection.auth_status));
+                        if connection.auth_status != "unsupported"
+                            && ui.button("Tarayıcıda giriş yap").clicked()
+                        {
+                            self.command(Command::SignInMcp(connection.name.clone()));
+                        }
+                        for tool in connection.tools.values() {
+                            ui.label(&tool.name)
+                                .on_hover_text(tool.description.as_deref().unwrap_or_default());
+                        }
+                    });
+                }
+            }
+        });
+        if local
+            .jobs
+            .iter()
+            .any(|job| job.status == WorkspaceJobStatus::Pending)
+            && ui
+                .button(if local.task_models.is_empty() {
+                    "Codex modellerini yükle"
+                } else {
+                    "Codex modellerini yenile"
+                })
+                .clicked()
+        {
+            self.command(Command::LoadTaskModels);
+        }
+        if let Some(approval) = &local.task_approval {
+            let (icon, title, action) = if approval.file {
+                (Outline::Attachment, "Dosya paylaşımı", "Dosyayı onayla")
+            } else if approval.action.starts_with("MCP araç çağrısı") {
+                (Outline::Agent, "MCP araç çağrısı", "Çağrıyı onayla")
+            } else {
+                (Outline::Agent, "Pencere eylemi", "Eylemi onayla")
+            };
+            visual::profile_section(ui, icon, title, |ui| {
+                ui.label(RichText::new(&approval.title).strong());
+                ui.label(&approval.action);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(action).clicked() {
+                        self.command(Command::DecideTaskAction(approval.id, true));
+                    }
+                    if ui.button("Reddet").clicked() {
+                        self.command(Command::DecideTaskAction(approval.id, false));
+                    }
+                });
+            });
+        } else {
+            #[cfg(windows)]
+            self.desktop_task_controls(ui, local);
+        }
+        for job in local.jobs.iter().rev().take(12) {
+            ui.push_id((job.id, job.approval_round), |ui| {
+                if job.continuation.is_some() {
+                    ui.weak(if job.forked { "Yeni Codex görev kolu" } else { "Codex görevinin devamı" });
+                }
+                ui.label(&job.task);
+                ui.weak(job.directory.display().to_string());
+                if let Some(name) = &job.attachment {
+                    visual::label_icon(ui, Outline::Attachment, RichText::new(name).strong());
+                    ui.weak("Görev onaylanınca ek Codex tarafından incelenebilir.");
+                }
+                if let Some(model) = &job.model {
+                    ui.weak(format!(
+                        "{} · {}",
+                        model.model,
+                        reasoning_label(&model.effort)
+                    ));
+                }
+                if job.plan_only {
+                    ui.weak("Salt okunur planlama");
+                }
+                if job.review.is_some() {
+                    ui.weak("Salt okunur Git incelemesi");
+                }
+                if job.network {
+                    ui.weak("Çalışma komutlarında ağ erişimi açık.");
+                }
+                if !job.skill_names.is_empty() {
+                    ui.weak(format!("Beceriler · {}", job.skill_names.join(", ")));
+                }
+                let running = job.status == WorkspaceJobStatus::Running;
+                let report = if running {
+                    local.workspace_progress.as_ref()
+                } else {
+                    local.workspace_reports.get(&job.id).map(AsRef::as_ref)
+                };
+                match &job.status {
+                    WorkspaceJobStatus::Pending => {
+                        if job.recovery.is_some() {
+                            ui.weak("Kesilen görevin geçmişi korunuyor. İzinleri yeniden seçerek devam edebilirsin.");
+                        }
+                        use crate::agent::app_server::ModelChoice;
+                        let model_id = ui.id().with("model-choice");
+                        let mut model = ui.data(|data| data.get_temp::<Option<ModelChoice>>(model_id))
+                            .unwrap_or_else(|| local.settings.task_model.clone());
+                        let default_label = if job.continuation.is_some() {
+                            "Önceki görev oturumunun ayarı"
+                        } else {
+                            "Codex varsayılanı"
+                        };
+                        if task_model_picker(ui, &local.task_models, default_label, &mut model) {
+                            ui.data_mut(|data| data.insert_temp(model_id, model.clone()));
+                        }
+                        let skills = self.task_skill_picker(ui, local.task_skills.as_deref());
+                        let mcp_id = ui.id().with("task-mcp");
+                        let mut mcp = ui.data(|data| data.get_temp::<bool>(mcp_id).unwrap_or_default());
+                        if local.task_mcp.as_ref().is_some_and(|connections| !connections.is_empty()) {
+                            if ui.checkbox(&mut mcp, "Bu görevde listedeki MCP araçlarını kullan")
+                                .on_hover_text("Çalıştırma modunda her çağrı için sunucu, araç ve parametreler ayrıca onayına sunulur.")
+                                .changed() {
+                                ui.data_mut(|data| data.insert_temp(mcp_id, mcp));
+                            }
+                        } else { mcp = false; }
+                        let fork_id = ui.id().with("fork-task");
+                        let mut fork = false;
+                        if job.can_fork() {
+                            fork = ui.data(|data| data.get_temp::<bool>(fork_id).unwrap_or_default());
+                            if ui.checkbox(&mut fork, "Ayrı bir kolda devam et")
+                                .on_hover_text("Yeni kol alıntılanan yanıta kadarki Codex geçmişini kullanır.")
+                                .changed()
+                            {
+                                ui.data_mut(|data| data.insert_temp(fork_id, fork));
+                            }
+                        }
+                        let compact_id = ui.id().with("compact-before");
+                        let mut compact_before = false;
+                        if job.continuation.is_some() {
+                            compact_before = ui.data(|data| data.get_temp::<bool>(compact_id).unwrap_or_default());
+                            if ui.checkbox(&mut compact_before, "Önce Codex bağlamını sıkıştır")
+                                .on_hover_text("Codex, aynı görev oturumuna devam etmeden önce önceki bağlamı özetler.")
+                                .changed()
+                            {
+                                ui.data_mut(|data| data.insert_temp(compact_id, compact_before));
+                            }
+                        }
+                        let search_id = ui.id().with("job-web-research");
+                        let delegate_id = ui.id().with("job-delegate");
+                        let mut delegate = ui.data(|data| data.get_temp::<bool>(delegate_id).unwrap_or_default());
+                        if ui.checkbox(&mut delegate, "Bu görev için alt ajanlara iş devret")
+                            .on_hover_text("Codex bağımsız alt işleri yerel alt ajanlara devredebilir. Aynı anda en fazla üç alt ajan çalışır. Pencere, dosya paylaşımı ve MCP işlemlerini ana ajan yürütür.")
+                            .changed() { ui.data_mut(|data| data.insert_temp(delegate_id, delegate)); }
+                        let network_id = ui.id().with("job-network");
+                        let mut network = ui.data(|data| data.get_temp::<bool>(network_id).unwrap_or_default());
+                        ui.weak(format!("Çalıştırma erişimi · {}", local.settings.task_access.label()));
+                        if local.settings.task_access == TaskAccess::Workspace
+                            && ui.checkbox(&mut network, "Bu görevde ağ erişimi kullan")
+                            .on_hover_text("Bu görev için Codex ağ iznini açar. Ağ kısıtlamasını cihazdaki Codex sandbox'ı uygular.")
+                            .changed() {
+                            ui.data_mut(|data| data.insert_temp(network_id, network));
+                        }
+                        #[cfg(windows)]
+                        if local.settings.task_access == TaskAccess::Workspace && !network {
+                            ui.small("Windows'ta yerel bağlantılar erişilebilir kalabilir.");
+                        }
+                        let mut web_research =
+                            ui.data(|data| data.get_temp::<bool>(search_id).unwrap_or(false));
+                        if ui
+                            .checkbox(&mut web_research, "Bu görevde web araştırmasına izin ver")
+                            .on_hover_text(
+                                "Arama sorguları OpenAI’nin web arama aracı tarafından işlenir.",
+                            )
+                            .changed()
+                        {
+                            ui.data_mut(|data| data.insert_temp(search_id, web_research));
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, plan_only) in
+                                [("Planla", true), (if local.settings.task_access == TaskAccess::Full {
+                                    "Tam erişimle çalıştır"
+                                } else { "Bu klasörde çalıştır" }, false)]
+                            {
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(if plan_only {
+                                        "Klasörü salt okunur incele ve plan hazırla."
+                                    } else {
+                                        local.settings.task_access.label()
+                                    })
+                                    .clicked()
+                                {
+                                    self.command(Command::DecideWorkspaceJob(
+                                        job.id,
+                                        WorkspaceDecision::Approve {
+                                            web_research,
+                                            network: network && !plan_only,
+                                            delegate: delegate && !plan_only,
+                                            model: model.clone(),
+                                            plan_only,
+                                            skills: skills.clone(),
+                                            compact_before,
+                                            fork,
+                                            mcp: mcp && !plan_only,
+                                        },
+                                    ));
+                                }
+                            }
+                            if ui.button("Reddet").clicked() {
+                                self.command(Command::DecideWorkspaceJob(
+                                    job.id,
+                                    WorkspaceDecision::Reject,
+                                ));
+                            }
+                        });
+                        if let Some(target) = task_review_picker(ui) {
+                            self.command(Command::DecideWorkspaceJob(
+                                job.id,
+                                WorkspaceDecision::Review { model, target },
+                            ));
+                        }
+                    }
+                    WorkspaceJobStatus::Running => {
+                        if job.web_research {
+                            ui.weak("Web araştırmasına izin verildi.");
+                        }
+                        if let Some(progress) = report {
+                            use crate::agent::app_server::StepState;
+                            if !progress.message.is_empty() {
+                                ui.weak(&progress.message);
+                            }
+                            for query in &progress.web_queries {
+                                ui.weak(format!("Web araması · {query}"));
+                            }
+                            for step in &progress.steps {
+                                let text = match step.state {
+                                    StepState::Pending => "Bekliyor",
+                                    StepState::Running => "Sürüyor",
+                                    StepState::Complete => "Tamamlandı",
+                                };
+                                ui.label(format!("{text} · {}", step.title));
+                            }
+                        }
+                        if ui.button("Görevi durdur").clicked() {
+                            self.command(Command::CancelWorkspaceJob(job.id));
+                        }
+                    }
+                    WorkspaceJobStatus::Complete => {
+                        let pending = local.hosts.get(&job.selection.host).and_then(|link| {
+                            link.queue.iter().find(|item| item.draft.id == job.id)
+                        });
+                        if let Some(pending) = pending {
+                            ui.weak("Sonuç gönderim kuyruğunda.");
+                            if let Some(error) = &pending.error {
+                                ui.label(RichText::new(error).color(visual::INVALID));
+                                if ui.button("Yeniden dene").clicked() {
+                                    self.command(Command::Retry(job.selection.clone(), job.id));
+                                }
+                            }
+                            if pending.binary.is_some()
+                                && let Some(session) = &self.session
+                            {
+                                if let Some((offset, total)) = session.transfer_progress(job.id) {
+                                    ui.add(
+                                        egui::ProgressBar::new(offset as f32 / total as f32)
+                                            .show_percentage(),
+                                    );
+                                }
+                                if ui.button("Dosya gönderimini iptal et").clicked() {
+                                    session.cancel_transfer(job.selection.clone(), job.id);
+                                }
+                            }
+                        } else if local.hosts.get(&job.selection.host).is_some_and(|link| {
+                            link.messages
+                                .values()
+                                .any(|message| message.client_id == job.id)
+                        }) {
+                            ui.weak("Sonuç gönderildi.");
+                        } else {
+                            ui.weak("Gönderim sona erdi.");
+                        }
+                    }
+                    WorkspaceJobStatus::Rejected => {
+                        ui.weak("Reddedildi.");
+                    }
+                    WorkspaceJobStatus::Cancelled => {
+                        ui.weak("Durduruldu.");
+                        if ui.button(if job.recovery.is_some() { "Devamı onaya al" } else { "Yeniden onaya al" }).clicked() {
+                            self.command(Command::RetryWorkspaceJob(job.id));
+                        }
+                    }
+                    WorkspaceJobStatus::Failed(error) => {
+                        ui.label(RichText::new(error).color(visual::INVALID));
+                        if ui.button(if job.recovery.is_some() { "Devamı onaya al" } else { "Yeniden onaya al" }).clicked() {
+                            self.command(Command::RetryWorkspaceJob(job.id));
+                        }
+                    }
+                }
+                if let Some(report) = report.filter(|report| !report.agents.is_empty()) {
+                    egui::CollapsingHeader::new("Alt ajanlar").default_open(true).show(ui, |ui| {
+                        for agent in &report.agents {
+                            let state = match agent.state.as_str() {
+                                "started" | "resumed" => if running { "Çalışıyor" } else { "Son durum alınamadı" },
+                                "completed" => "Tamamlandı",
+                                "interrupted" => "Kesildi",
+                                "closed" => "Kapatıldı",
+                                _ => "Durum güncellendi",
+                            };
+                            visual::label_icon(ui, Outline::Agent, RichText::new(format!("{} · {state}", agent.name)).strong());
+                            if let Some(model) = &agent.model {
+                                ui.weak(format!("{} · {}", model, agent.effort.as_deref().map(reasoning_label).unwrap_or("Varsayılan")));
+                            }
+                        }
+                    });
+                }
+                if let Some(report) = report.filter(|report| !report.commands.is_empty()) {
+                    use crate::agent::app_server::CommandState;
+                    egui::CollapsingHeader::new("Komut etkinliği").show(ui, |ui| {
+                        for command in &report.commands {
+                            let status = match (command.state, command.exit) {
+                                (CommandState::Running, _) if running => "Çalışıyor",
+                                (CommandState::Running, _) => "Sonuç alınamadı",
+                                (CommandState::Complete, Some(exit)) if exit != 0 => "Başarısız",
+                                (CommandState::Complete, _) => "Tamamlandı",
+                                (CommandState::Failed, _) => "Başarısız",
+                                (CommandState::Declined, _) => "Reddedildi",
+                            };
+                            let title = match command.exit {
+                                Some(code) => format!("{status} · Çıkış kodu {code}"),
+                                None => status.into(),
+                            };
+                            egui::CollapsingHeader::new(format!(
+                                "{title} · {}",
+                                short(&command.command, 80)
+                            ))
+                            .id_salt(&command.id)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&command.command).monospace().strong());
+                                if !command.output.is_empty() {
+                                    ScrollArea::vertical().max_height(160.).show(ui, |ui| {
+                                        ui.label(RichText::new(&command.output).monospace());
+                                    });
+                                }
+                                if command.truncated {
+                                    ui.weak("Çıktının ilk 4 KiB’ı gösteriliyor.");
+                                }
+                            });
+                        }
+                    });
+                }
+                if let Some(diff) = report.and_then(|report| report.diff.as_ref()) {
+                    egui::CollapsingHeader::new("Dosya değişikliklerini incele").show(ui, |ui| {
+                        if diff.truncated {
+                            ui.weak("Önizleme ilk 64 KiB ile sınırlı.");
+                        }
+                        let lines: Vec<_> = diff.body.lines().collect();
+                        let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                        ScrollArea::both()
+                            .max_height(250.)
+                            .auto_shrink([false, true])
+                            .show_rows(ui, line_height, lines.len(), |ui, rows| {
+                                for line in &lines[rows] {
+                                    let text = RichText::new(*line).monospace();
+                                    let text =
+                                        if line.starts_with("diff ") || line.starts_with("@@") {
+                                            text.strong()
+                                        } else if line.starts_with('+') {
+                                            text.color(Color32::from_rgb(151, 224, 172))
+                                        } else if line.starts_with('-') {
+                                            text.color(visual::INVALID)
+                                        } else {
+                                            text
+                                        };
+                                    ui.add(egui::Label::new(text).extend());
+                                }
+                            });
+                    });
+                }
+                if report.is_some_and(|report| report.context_compacted) {
+                    ui.weak("Codex bağlamı sıkıştırıldı.");
+                }
+                if let Some(usage) = report.and_then(|report| report.usage.as_ref()) {
+                    egui::CollapsingHeader::new("Token kullanımı").show(ui, |ui| {
+                        ui.label(format!("Oturum toplamı · {}", usage.total.total_tokens));
+                        ui.weak(format!("Girdi · {} · Önbellekten · {}", usage.total.input_tokens, usage.total.cached_input_tokens));
+                        ui.weak(format!("Çıktı · {} · Düşünme · {}", usage.total.output_tokens, usage.total.reasoning_output_tokens));
+                        ui.weak(format!("Son model çağrısı · {} token", usage.last.total_tokens));
+                        if let Some(window) = usage.model_context_window.filter(|limit| *limit > 0) {
+                            ui.weak(format!("Model bağlam kapasitesi · {window} token"));
+                        }
+                    });
+                }
+                ui.separator();
+            });
+        }
+    }
+
+    fn mcp_setup(&mut self, ui: &mut Ui) {
+        ui.collapsing("Yeni MCP bağlantısı", |ui| {
+            field(ui, "Bağlantı adı", &mut self.mcp_form.name, "ör. rea");
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.mcp_form.remote, false, "Yerel program");
+                ui.selectable_value(&mut self.mcp_form.remote, true, "Sunucu adresi");
+            });
+            if self.mcp_form.remote {
+                field(ui, "MCP adresi", &mut self.mcp_form.url, "https://sunucu.example/mcp");
+                ui.weak("OAuth destekleyen bağlantılarda araç listesinden tarayıcıda giriş yapabilirsin.");
+            } else {
+                field(ui, "Program", &mut self.mcp_form.command, "Programın tam yolu veya komut adı");
+                if ui.small_button("Program seç").clicked()
+                    && let Some(path) = rfd::FileDialog::new().set_title("MCP programını seç").pick_file()
+                { self.mcp_form.command = path.to_string_lossy().into_owned(); }
+                ui.label("Argümanlar · her satıra bir tane");
+                ui.add(egui::TextEdit::multiline(&mut self.mcp_form.args).desired_rows(3).desired_width(f32::INFINITY).hint_text("--port\n8080"));
+                ui.weak("Program, bağlantıları listelediğinde başlatılır. Argümanları tırnak içine alma.");
+            }
+            let filled = !self.mcp_form.name.trim().is_empty() && if self.mcp_form.remote { !self.mcp_form.url.trim().is_empty() } else { !self.mcp_form.command.trim().is_empty() };
+            if ui.add_enabled(filled, egui::Button::new("Bağlantıyı kaydet")).clicked() {
+                use crate::agent::app_server::{McpSetup, McpTransport};
+                let transport = if self.mcp_form.remote {
+                    McpTransport::Http { url: self.mcp_form.url.trim().to_owned() }
+                } else {
+                    McpTransport::Stdio {
+                        command: self.mcp_form.command.trim().to_owned(),
+                        args: self.mcp_form.args.lines().filter(|line| !line.is_empty()).map(str::to_owned).collect(),
+                    }
+                };
+                self.command(Command::AddTaskMcp(McpSetup { name: self.mcp_form.name.trim().to_owned(), transport }));
+            }
+        });
+    }
+
+    fn task_skill_picker(
+        &mut self,
+        ui: &mut Ui,
+        skills: Option<&[crate::agent::app_server::TaskSkill]>,
+    ) -> Vec<std::path::PathBuf> {
+        let id = ui.id().with("task-skills");
+        let mut selected = ui
+            .data(|data| data.get_temp::<Vec<std::path::PathBuf>>(id))
+            .unwrap_or_default();
+        selected.retain(|path| {
+            skills.is_some_and(|skills| skills.iter().any(|skill| skill.path == *path))
+        });
+        let title = if selected.is_empty() {
+            "Codex becerileri".into()
+        } else {
+            format!("Codex becerileri · {} seçildi", selected.len())
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt("skill-picker")
+            .show(ui, |ui| {
+                if ui
+                    .button(if skills.is_some() {
+                        "Becerileri yenile"
+                    } else {
+                        "Becerileri yükle"
+                    })
+                    .clicked()
+                {
+                    self.command(Command::LoadTaskSkills);
+                }
+                if let Some(skills) = skills {
+                    if skills.is_empty() {
+                        ui.weak("Bu klasör için etkin beceri bulunamadı.");
+                    }
+                    for skill in skills {
+                        let active = selected.iter().position(|path| *path == skill.path);
+                        let mut checked = active.is_some();
+                        ui.push_id(&skill.path, |ui| {
+                            let scope = match skill.scope.as_str() {
+                                "repo" => "Proje",
+                                "user" => "Kişisel",
+                                "system" => "Sistem",
+                                "admin" => "Yönetici",
+                                other => other,
+                            };
+                            if ui
+                                .checkbox(&mut checked, format!("{} · {scope}", skill.name))
+                                .on_hover_text(&skill.description)
+                                .changed()
+                            {
+                                if let Some(index) = active {
+                                    selected.remove(index);
+                                }
+                                if checked {
+                                    selected.push(skill.path.clone());
+                                }
+                            }
+                        });
+                    }
+                }
+                ui.weak("Seçimler yalnızca bu görevin planlama veya çalıştırma adımına eklenir.");
+            });
+        ui.data_mut(|data| data.insert_temp(id, selected.clone()));
+        selected
+    }
+
+    #[cfg(windows)]
+    fn desktop_task_controls(&mut self, ui: &mut Ui, local: &crate::session::Local) {
+        ui.add_space(8.);
+        visual::profile_section(ui, Outline::Agent, "Pencere araçları", |ui| {
+            let running = local
+                .jobs
+                .iter()
+                .any(|job| job.status == crate::session::WorkspaceJobStatus::Running);
+            let request = local.desktop_request.as_ref();
+            let target = if running {
+                local.desktop_active.as_ref()
+            } else {
+                local.desktop_target.as_ref()
+            };
+            if let Some(request) = request {
+                ui.label(RichText::new("Codex pencere seçmeni istiyor").strong());
+                ui.label(&request.reason);
+            } else if running {
+                if let Some(target) = target {
+                    ui.label(&target.title);
+                }
+                ui.weak("Pencere eylemi istenirse burada onay isteyecek.");
+                return;
+            }
+            let title =
+                target.map_or_else(|| "Pencere seç…".into(), |target| short(&target.title, 31));
+            egui::ComboBox::from_id_salt("desktop-task-target")
+                .selected_text(title)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    if request.is_none()
+                        && ui
+                            .selectable_label(target.is_none(), "Pencere kullanma")
+                            .clicked()
+                    {
+                        self.command(Command::SetDesktopTarget(None));
+                    }
+                    let windows = crate::agent::desktop_tools::windows();
+                    if windows.is_empty() {
+                        ui.weak("Uygun, açık pencere bulunamadı.");
+                    }
+                    for window in windows {
+                        if ui
+                            .selectable_label(target == Some(&window), short(&window.title, 55))
+                            .on_hover_text(&window.title)
+                            .clicked()
+                        {
+                            self.command(match request {
+                                Some(request) => {
+                                    Command::DecideDesktopTarget(request.id, Some(window))
+                                }
+                                None => Command::SetDesktopTarget(Some(window)),
+                            });
+                        }
+                    }
+                });
+            if let Some(request) = request {
+                ui.weak("Ekran görüntüsü ve giriş işlemleri ayrıca onay ister.");
+                if ui.button("Pencere isteğini reddet").clicked() {
+                    self.command(Command::DecideDesktopTarget(request.id, None));
+                }
+            } else {
+                ui.weak("Seçim sıradaki görev içindir. Her pencere eylemi ayrı onay ister.");
+                ui.weak("Onaylanan görüntüler Codex görev geçmişine girebilir.");
+            }
+        });
+        ui.add_space(8.);
+    }
+}
+
+fn right_drawer(
+    ctx: &UiContext,
+    role: Role,
+    id: &'static str,
+    icon: Outline,
+    title: &str,
+    contents: impl FnOnce(&mut Ui),
+) -> bool {
+    let width = (ctx.available_rect().width() * 0.42).min(306.);
+    egui::SidePanel::right(id)
+        .exact_width(width)
+        .resizable(false)
+        .frame(
+            Frame::new()
+                .fill(visual::palette(role).panel)
+                .inner_margin(14),
+        )
+        .show(ctx, |ui| {
+            let mut close = false;
+            ui.horizontal(|ui| {
+                visual::label_icon(ui, icon, RichText::new(title).size(16.).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = visual::rail_button(ui, Outline::Cross, "Kapat", false).clicked();
+                });
+            });
+            ui.separator();
+            ui.add_space(10.);
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, contents);
+            close
+        })
+        .inner
 }
 
 impl eframe::App for App {
@@ -3178,6 +4645,7 @@ impl eframe::App for App {
             return;
         }
         if self.identity.is_none() {
+            self.viewer.close();
             self.login(ctx);
             #[cfg(windows)]
             taskbar::update(&mut self.taskbar_icon, _frame, self.role);
@@ -3192,6 +4660,9 @@ impl eframe::App for App {
         }
         self.chat_dialogs(ctx);
         self.workspace(ctx);
+        if self.viewer.is_open() {
+            self.viewer.show(ctx);
+        }
         self.save_preferences();
         ctx.request_repaint_after(Duration::from_millis(180));
     }
@@ -3254,6 +4725,155 @@ fn nav(ui: &mut Ui, page: &mut Page, choice: Page, label: &str) {
         *page = choice;
     }
 }
+fn task_review_picker(ui: &mut Ui) -> Option<crate::agent::app_server::ReviewTarget> {
+    use crate::agent::app_server::ReviewTarget;
+    egui::CollapsingHeader::new("Kod incelemesi")
+        .show(ui, |ui| {
+            const TARGETS: [&str; 3] = [
+                "Kaydedilmemiş değişiklikler",
+                "Temel dalla karşılaştır",
+                "Bir commit seç",
+            ];
+            let state = ui.id().with("git-review-target");
+            let (mut kind, mut reference) = ui
+                .data(|data| data.get_temp::<(usize, String)>(state))
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("git-target")
+                .selected_text(TARGETS[kind])
+                .show_ui(ui, |ui| {
+                    for (index, label) in TARGETS.iter().enumerate() {
+                        if ui.selectable_value(&mut kind, index, *label).clicked() {
+                            reference.clear();
+                        }
+                    }
+                });
+            if kind != 0 {
+                ui.add(
+                    egui::TextEdit::singleline(&mut reference).hint_text(if kind == 1 {
+                        "ör. main"
+                    } else {
+                        "Commit kimliği"
+                    }),
+                );
+            }
+            let target = match kind {
+                1 => ReviewTarget::BaseBranch {
+                    branch: reference.trim().into(),
+                },
+                2 => ReviewTarget::Commit {
+                    sha: reference.trim().into(),
+                },
+                _ => ReviewTarget::UncommittedChanges,
+            };
+            ui.data_mut(|data| data.insert_temp(state, (kind, reference)));
+            ui.add_enabled(target.valid(), egui::Button::new("İncelemeyi başlat"))
+                .clicked()
+                .then_some(target)
+        })
+        .body_returned
+        .flatten()
+}
+
+fn task_access_picker(ui: &mut Ui, access: &mut TaskAccess) {
+    ui.label("Görev erişimi");
+    egui::ComboBox::from_id_salt("task-access")
+        .selected_text(access.label())
+        .show_ui(ui, |ui| {
+            for (level, description) in [
+                (
+                    TaskAccess::Workspace,
+                    "Yazma işlemleri çalışma klasörüyle sınırlı.",
+                ),
+                (
+                    TaskAccess::WorkspaceNetwork,
+                    "Ağ açık, yazma işlemleri çalışma klasörüyle sınırlı.",
+                ),
+                (
+                    TaskAccess::Full,
+                    "Uygulamanın Windows hesabıyla erişebildiği dosyalar ve ağ.",
+                ),
+            ] {
+                ui.selectable_value(access, level, level.label())
+                    .on_hover_text(description);
+            }
+        });
+}
+
+fn task_model_picker(
+    ui: &mut Ui,
+    models: &[crate::agent::app_server::CatalogModel],
+    default_label: &str,
+    selected: &mut Option<crate::agent::app_server::ModelChoice>,
+) -> bool {
+    use crate::agent::app_server::ModelChoice;
+    let original = selected.clone();
+    let selected_name = selected.as_ref().and_then(|choice| {
+        models
+            .iter()
+            .find(|model| model.model == choice.model)
+            .map(|model| model.display_name.as_str())
+    });
+    ui.label("Görev modeli");
+    egui::ComboBox::from_id_salt("task-model")
+        .selected_text(
+            selected_name
+                .or_else(|| selected.as_ref().map(|choice| choice.model.as_str()))
+                .unwrap_or(default_label),
+        )
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(selected.is_none(), default_label)
+                .clicked()
+            {
+                *selected = None;
+            }
+            for model in models {
+                let active = selected
+                    .as_ref()
+                    .is_some_and(|choice| choice.model == model.model);
+                if ui.selectable_label(active, &model.display_name).clicked() && !active {
+                    *selected = Some(ModelChoice {
+                        model: model.model.clone(),
+                        effort: model.default_reasoning_effort.clone(),
+                    });
+                }
+            }
+        });
+    if let Some(choice) = selected {
+        ui.label("Düşünme düzeyi");
+        egui::ComboBox::from_id_salt("task-effort")
+            .selected_text(reasoning_label(&choice.effort))
+            .show_ui(ui, |ui| {
+                if let Some(model) = models.iter().find(|model| model.model == choice.model) {
+                    for effort in &model.supported_reasoning_efforts {
+                        let value = &effort.reasoning_effort;
+                        ui.selectable_value(
+                            &mut choice.effort,
+                            value.clone(),
+                            reasoning_label(value),
+                        );
+                    }
+                } else {
+                    ui.weak("Düzeyi değiştirmek için model listesini yükle.");
+                }
+            });
+    }
+    *selected != original
+}
+
+fn reasoning_label(effort: &str) -> &str {
+    match effort {
+        "none" => "Kapalı",
+        "minimal" => "En düşük",
+        "low" => "Düşük",
+        "medium" => "Orta",
+        "high" => "Yüksek",
+        "xhigh" => "Çok yüksek",
+        "max" => "Azami",
+        value => value,
+    }
+}
+
 fn short(text: &str, limit: usize) -> String {
     let line = text.lines().next().unwrap_or_default();
     let mut preview: String = line.chars().take(limit).collect();
@@ -3302,6 +4922,30 @@ fn file_size(bytes: usize) -> String {
     }
 }
 
+fn message_web_links(text: &str) -> Vec<reqwest::Url> {
+    let mut urls = Vec::new();
+    for (start, _) in text.match_indices("https://") {
+        let value = text[start..]
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ')' | ']' | '>' | '"' | '`'))
+            .next()
+            .unwrap_or_default();
+        let value = value.trim_end_matches(['.', ',', ';']);
+        if value.len() <= 400
+            && let Ok(url) = reqwest::Url::parse(value)
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && !urls.contains(&url)
+        {
+            urls.push(url);
+            if urls.len() == 5 {
+                break;
+            }
+        }
+    }
+    urls
+}
+
 fn mention_query(text: &str) -> Option<(usize, &str)> {
     let start = text.rfind('@')?;
     let query = &text[start + 1..];
@@ -3315,6 +4959,164 @@ fn mention_query(text: &str) -> Option<(usize, &str)> {
     } else {
         None
     }
+}
+
+struct SlashCommandSuggestion {
+    command: &'static str,
+    description: &'static str,
+    icon: Outline,
+}
+
+fn slash_command_token(draft: &str, cursor: usize) -> Option<(usize, usize, String)> {
+    let chars = draft.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let start = chars[..cursor].iter().rposition(|ch| *ch == '/')?;
+    if start > 0 && !chars[start - 1].is_whitespace() {
+        return None;
+    }
+    if chars[start..cursor].iter().any(|ch| ch.is_whitespace()) {
+        return None;
+    }
+    let end = start
+        + chars[start..]
+            .iter()
+            .position(|ch| ch.is_whitespace())
+            .unwrap_or(chars.len() - start);
+    Some((start, end, chars[start..cursor].iter().collect()))
+}
+
+fn replace_slash_token(draft: &str, start: usize, end: usize, command: &str) -> (String, usize) {
+    let byte_at = |char_index: usize| {
+        draft
+            .char_indices()
+            .nth(char_index)
+            .map_or(draft.len(), |(byte, _)| byte)
+    };
+    let start_byte = byte_at(start);
+    let end_byte = byte_at(end);
+    let add_space = end == draft.chars().count();
+    let insertion = if add_space {
+        format!("{command} ")
+    } else {
+        command.to_owned()
+    };
+    let caret = start + insertion.chars().count();
+    let mut result = String::with_capacity(draft.len() + insertion.len());
+    result.push_str(&draft[..start_byte]);
+    result.push_str(&insertion);
+    result.push_str(&draft[end_byte..]);
+    (result, caret)
+}
+
+fn consume_mode_slash_token(draft: &str, start: usize, end: usize) -> (String, usize) {
+    let byte_at = |char_index: usize| {
+        draft
+            .char_indices()
+            .nth(char_index)
+            .map_or(draft.len(), |(byte, _)| byte)
+    };
+    let start_byte = byte_at(start);
+    let mut end_byte = byte_at(end);
+    // Remove the command's separator too, preserving surrounding prose.
+    if draft[end_byte..].starts_with(' ') {
+        end_byte += 1;
+    }
+    let mut result = String::with_capacity(draft.len());
+    result.push_str(&draft[..start_byte]);
+    result.push_str(&draft[end_byte..]);
+    let caret = start.min(result.chars().count());
+    (result, caret)
+}
+
+fn loop_interval_label(seconds: u64) -> String {
+    match seconds {
+        10 => "10 sn".into(),
+        1800 => "30 dk".into(),
+        3600 => "1 saat".into(),
+        86400 => "1 gün".into(),
+        _ => format!("{seconds} sn"),
+    }
+}
+
+fn slash_mode(query: &str) -> Option<crate::protocol::MessageMode> {
+    match query {
+        "/goal" => Some(crate::protocol::MessageMode::Goal),
+        "/loop" => Some(crate::protocol::MessageMode::Loop {
+            interval_seconds: 60 * 60,
+        }),
+        _ => None,
+    }
+}
+
+// A complete command at the start of the draft still selects its mode even
+// after the caret has moved into the task text (including pasted drafts).
+fn leading_slash_mode(draft: &str) -> Option<(usize, usize, MessageMode)> {
+    use crate::session::automation::parse_interval;
+    let trimmed = draft.trim_start();
+    let token = trimmed.split_whitespace().next()?;
+    let mut mode = slash_mode(token)?;
+    let start = draft[..draft.len() - trimmed.len()].chars().count();
+    let mut end = start + token.chars().count();
+    if matches!(mode, MessageMode::Loop { .. }) {
+        let suffix = &trimmed[token.len()..];
+        let interval = suffix.trim_start();
+        if let Some(value) = interval.split_whitespace().next()
+            && let Ok(interval_seconds) = parse_interval(value)
+        {
+            end += suffix[..suffix.len() - interval.len()].chars().count() + value.chars().count();
+            mode = MessageMode::Loop { interval_seconds };
+        }
+    }
+    Some((start, end, mode))
+}
+
+fn is_automation_management(draft: &str) -> bool {
+    use crate::session::automation::{AutomationCommand, parse};
+    if !draft.trim_start().starts_with('/') || draft.trim() == "/loop" {
+        return false;
+    }
+    matches!(
+        parse(draft),
+        Ok(Some(
+            AutomationCommand::GoalStatus
+                | AutomationCommand::GoalStop
+                | AutomationCommand::GoalResume
+                | AutomationCommand::LoopList
+                | AutomationCommand::LoopStop { .. }
+        ))
+    )
+}
+
+fn set_composer_cursor(ctx: &UiContext, id: egui::Id, cursor: usize) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(cursor),
+        )));
+    state.store(ctx, id);
+}
+
+fn slash_command_suggestions(query: &str) -> Vec<&'static SlashCommandSuggestion> {
+    static COMMANDS: [SlashCommandSuggestion; 2] = [
+        SlashCommandSuggestion {
+            command: "/loop",
+            description: "Tekrarlanan bir çalışma planla",
+            icon: Outline::Loop,
+        },
+        SlashCommandSuggestion {
+            command: "/goal",
+            description: "Kalıcı bir hedefi izle",
+            icon: Outline::Goal,
+        },
+    ];
+    if !query.starts_with('/') || query.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|command| command.command.starts_with(query))
+        .collect()
 }
 
 fn mention_body<'a>(
@@ -3394,6 +5196,70 @@ fn delivery_status(message: &Message, receipts: &[Receipt]) -> DeliveryStatus {
 #[cfg(test)]
 mod visual_tests {
     use super::*;
+
+    #[test]
+    fn slash_autocomplete_limits_choices_to_supported_command_prefixes() {
+        let labels = |draft: &str| {
+            slash_command_suggestions(draft)
+                .iter()
+                .map(|suggestion| suggestion.command)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels("/"), ["/loop", "/goal"]);
+        assert_eq!(labels("/l"), ["/loop"]);
+        assert_eq!(labels("/g"), ["/goal"]);
+        assert!(labels("/unknown").is_empty());
+        assert!(labels("/goal status").is_empty());
+    }
+
+    #[test]
+    fn slash_token_is_found_at_cursor_inside_a_sentence() {
+        let draft = "Merhaba dünya /go devam";
+        let cursor = "Merhaba dünya /go".chars().count();
+        let (start, end, query) = slash_command_token(draft, cursor).unwrap();
+        assert_eq!(query, "/go");
+        assert_eq!(
+            draft
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>(),
+            "/go"
+        );
+        assert_eq!(slash_command_suggestions(&query).len(), 1);
+    }
+
+    #[test]
+    fn completing_middle_token_preserves_unicode_prefix_and_suffix() {
+        let draft = "Türkçe /go devam eder";
+        let (start, end, _) = slash_command_token(draft, "Türkçe /go".chars().count()).unwrap();
+        let (updated, caret) = replace_slash_token(draft, start, end, "/goal");
+        assert_eq!(updated, "Türkçe /goal devam eder");
+        assert_eq!(
+            updated.chars().take(caret).collect::<String>(),
+            "Türkçe /goal"
+        );
+    }
+
+    #[test]
+    fn slash_suggestions_use_only_text_before_a_mid_token_caret() {
+        let draft = "Türkçe /goal devam";
+        let cursor = "Türkçe /go".chars().count();
+        let (start, end, query) = slash_command_token(draft, cursor).unwrap();
+        assert_eq!(query, "/go");
+        assert_eq!(slash_command_suggestions(&query).len(), 1);
+        let (updated, _) = replace_slash_token(draft, start, end, "/goal");
+        assert_eq!(updated, "Türkçe /goal devam");
+    }
+
+    #[test]
+    fn completing_end_token_adds_space_and_places_caret_after_command() {
+        let draft = "İş /loo";
+        let (start, end, _) = slash_command_token(draft, draft.chars().count()).unwrap();
+        let (updated, caret) = replace_slash_token(draft, start, end, "/loop");
+        assert_eq!(updated, "İş /loop ");
+        assert_eq!(updated.chars().take(caret).collect::<String>(), "İş /loop ");
+    }
 
     #[test]
     fn left_role_card_changes_form_and_profile_directory() {
@@ -3617,6 +5483,75 @@ mod visual_tests {
     }
 
     #[test]
+    fn enter_commits_goal_without_sending_then_enter_sends_clean_text() -> Result<()> {
+        let me = Identity::generate(Role::Human, "deniz", "Deniz")?;
+        let room = Room {
+            id: uuid::Uuid::new_v4(),
+            name: "Test".into(),
+            owner: me.id().into(),
+            group: false,
+            active: true,
+            closed: false,
+            members: vec![me.card.clone()],
+        };
+        let selection = Selection {
+            host: "test".into(),
+            room: room.id,
+        };
+        let ctx = UiContext::default();
+        visual::theme(&ctx, Role::Human);
+        let mut app = App::new(Role::Human, PathBuf::new());
+        app.identity = Some(me);
+        app.draft = "/goal Deneme hedefi".into();
+        let draw = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080., 720.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| app.chat_composer(ui, &selection, &room, 0));
+                },
+            )
+        };
+        draw(&mut app, vec![]);
+        let id = egui::Id::new(("conversation-composer", room.id)).with("input");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        set_composer_cursor(&ctx, id, app.draft.chars().count());
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(&mut app, vec![enter()]);
+        assert_eq!(app.draft_mode, Some(MessageMode::Goal));
+        assert_eq!(app.draft, "Deneme hedefi");
+        assert!(app.submitted.is_none(), "selecting a mode must not send");
+        draw(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![enter()]);
+        let sent = &app.submitted.as_ref().expect("ordinary Enter sends").2;
+        assert_eq!(sent.text, "Deneme hedefi");
+        assert_eq!(sent.mode, Some(MessageMode::Goal));
+        Ok(())
+    }
+
+    #[test]
     fn short_messages_stay_compact_and_composer_stays_at_the_bottom() -> Result<()> {
         let me = Identity::generate(Role::Human, "deniz", "Deniz")?;
         let other = Identity::generate(Role::Agent, "asistan", "ChatOid Asistan")?;
@@ -3630,6 +5565,9 @@ mod visual_tests {
             members: vec![me.card.clone(), other.card.clone()],
         };
         let make = |seq, author, text: String| Message {
+            mode: None,
+            withdrawn: false,
+            undo_until_ms: 0,
             seq,
             room: room.id,
             client_id: uuid::Uuid::new_v4(),
@@ -3771,6 +5709,177 @@ mod visual_tests {
     }
 
     #[test]
+    fn profile_actions_open_the_editor_to_the_right() -> Result<()> {
+        let ctx = UiContext::default();
+        visual::theme(&ctx, Role::Human);
+        let mut app = App::new(Role::Human, PathBuf::new());
+        app.identity = Some(Identity::generate(Role::Human, "deniz", "Deniz")?);
+        app.page = Page::Profile;
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080., 850.));
+        let draw = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(bounds),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.navigation(ctx);
+                    app.workspace(ctx);
+                },
+            )
+        };
+        let point = |frame: &egui::FullOutput, label: &str| {
+            frame.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(shape.shape.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+        };
+        let click = |position, pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let initial = draw(&mut app, vec![]);
+        let hero = initial
+            .shapes
+            .iter()
+            .find_map(|entry| match &entry.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == visual::palette(Role::Human).tint
+                        && rect.rect.height() > 120.
+                        && rect.rect.width() > 200. =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("profile hero");
+        assert!(hero.width() <= 421. && (hero.center().x - bounds.center().x).abs() < 34.);
+        assert!(point(&initial, "Adı kaydet").is_none());
+
+        let edit = point(&initial, "Görünen adı düzenle").expect("edit action");
+        draw(&mut app, click(edit, true));
+        draw(&mut app, click(edit, false));
+        let editor = draw(&mut app, vec![]);
+        assert_eq!(app.profile_pane, Some(ProfilePane::Name));
+        assert!(point(&editor, "Adı kaydet").expect("save action").x > edit.x + 200.);
+        let cancel = point(&editor, "Vazgeç").expect("cancel action");
+        draw(&mut app, click(cancel, true));
+        draw(&mut app, click(cancel, false));
+        let closed = draw(&mut app, vec![]);
+        assert_eq!(app.profile_pane, None);
+
+        let photo = point(&closed, "Fotoğraf ekle").expect("photo action");
+        draw(&mut app, click(photo, true));
+        draw(&mut app, click(photo, false));
+        let options = draw(&mut app, vec![]);
+        assert_eq!(app.profile_pane, Some(ProfilePane::Photo));
+        assert!(point(&options, "Profil fotoğrafı").expect("photo panel").x > photo.x + 200.);
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720., 505.));
+        let narrow_frame = |app: &mut App| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(narrow),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.navigation(ctx);
+                    app.workspace(ctx);
+                },
+            )
+        };
+        narrow_frame(&mut app);
+        let overlay = narrow_frame(&mut app);
+        let photo_title = point(&overlay, "Profil fotoğrafı").expect("narrow photo panel");
+        let profile_title = point(&overlay, "Profilim").expect("profile stays visible");
+        assert!(photo_title.x > 450. && photo_title.x > profile_title.x + 200.);
+        assert!(photo_title.y <= profile_title.y);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_jobs_open_next_to_agent_identity() -> Result<()> {
+        let ctx = UiContext::default();
+        visual::theme(&ctx, Role::Agent);
+        let mut app = App::new(Role::Agent, PathBuf::new());
+        app.identity = Some(Identity::generate(Role::Agent, "poyraz", "Poyraz")?);
+        let draw = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720., 505.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.navigation(ctx);
+                    app.workspace(ctx);
+                },
+            )
+        };
+        let initial = draw(&mut app, vec![]);
+        let label_positions = |frame: &egui::FullOutput| {
+            frame
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Codex görevleri" => {
+                        Some(shape.shape.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let opener = label_positions(&initial)[0];
+        for pressed in [true, false] {
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(opener),
+                    egui::Event::PointerButton {
+                        pos: opener,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let open = draw(&mut app, vec![]);
+        let positions = label_positions(&open);
+        assert_eq!(positions.len(), 2);
+        assert!(
+            positions
+                .iter()
+                .any(|pos| pos.x > opener.x + 190. && pos.y <= opener.y)
+        );
+        let closed = draw(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(label_positions(&closed).len(), 1);
+        assert!(app.workspace_jobs_opener.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn signed_in_screens_show_their_primary_controls_at_supported_widths() -> Result<()> {
         let cases = [
             (Page::Chats, "İlk sohbetini başlat", "Kişi ekle"),
@@ -3778,7 +5887,7 @@ mod visual_tests {
             (Page::Contacts, "Kişi kartım", "İçe aktar"),
             (Page::Host, "Ağ durumu", "Bu cihazı host yap"),
             (Page::Settings, "Sohbet arka planı", "Varsayılana dön"),
-            (Page::Profile, "Profilim", "Adı kaydet"),
+            (Page::Profile, "Profilim", "Görünen adı düzenle"),
         ];
         for width in [720., 1080.] {
             for (page, title, action) in cases {

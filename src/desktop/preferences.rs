@@ -9,12 +9,15 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::protocol::MessageMode;
+
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DraftState {
     pub text: String,
     pub reply: Option<(i64, String, String)>,
     pub attachment: Option<PathBuf>,
+    pub mode: Option<MessageMode>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -178,6 +181,7 @@ mod tests {
         preferences.drafts.insert(
             "host/oda".into(),
             DraftState {
+                mode: Some(MessageMode::Goal),
                 text: "Sohbet taslağı".into(),
                 reply: Some((17, "Deniz".into(), "Eski mesaj".into())),
                 attachment: Some(attached.clone()),

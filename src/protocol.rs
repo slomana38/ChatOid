@@ -477,6 +477,12 @@ pub struct Message {
     pub reply: Option<Quote>,
     pub root: Option<i64>,
     pub invitation: Option<Ticket>,
+    #[serde(default)]
+    pub withdrawn: bool,
+    #[serde(default)]
+    pub undo_until_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<MessageMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<AttachmentInfo>,
 }
@@ -489,7 +495,17 @@ pub struct Draft {
     pub reply: Option<i64>,
     pub invitation: Option<Ticket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<MessageMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageMode {
+    Plain,
+    Goal,
+    Loop { interval_seconds: u64 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,6 +514,10 @@ pub struct Sync {
     pub rooms: Vec<Room>,
     pub requests: Vec<Request>,
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdrawn_messages: Vec<i64>,
+    #[serde(default)]
+    pub supports_message_modes: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipts: Vec<Receipt>,
     #[serde(default)]
@@ -508,11 +528,51 @@ pub struct Sync {
     pub introductions: Vec<Ticket>,
     #[serde(default)]
     pub max_file_bytes: usize,
+    #[serde(default)]
+    pub agent_binary_files: bool,
+    #[serde(default)]
+    pub supports_task_activity: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_activity: Vec<TaskActivity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Pending,
+    Running,
+    WaitingApproval,
+    WaitingAnswer,
+    Stopping,
+    Complete,
+    Rejected,
+    Cancelled,
+    Failed,
+}
+
+impl TaskPhase {
+    pub fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Rejected | Self::Cancelled | Self::Failed
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskActivity {
+    pub room: Uuid,
+    pub source: i64,
+    pub phase: TaskPhase,
+    pub plan: Option<[u16; 2]>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Action {
+    PublishTaskActivity {
+        activity: TaskActivity,
+    },
     Sync {
         after: i64,
         grants: Vec<Grant>,
@@ -547,6 +607,14 @@ pub enum Action {
     },
     Send {
         draft: Draft,
+    },
+    WithdrawMessage {
+        room: Uuid,
+        seq: i64,
+    },
+    CanProcessMessage {
+        room: Uuid,
+        seq: i64,
     },
     SendBinary {
         draft: Draft,
@@ -585,4 +653,12 @@ pub enum Action {
     LoadProfile {
         actor: String,
     },
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }

@@ -1,6 +1,6 @@
 use std::{
     fmt, fs,
-    io::Read,
+    io::{Read, Write},
     net::{SocketAddr, TcpListener},
     path::Path,
     sync::{Arc, Once},
@@ -431,5 +431,46 @@ impl Connection {
             "Geçersiz dosya parçası"
         );
         Ok(bytes)
+    }
+
+    pub fn download_attachment(
+        &mut self,
+        identity: &Identity,
+        message: &Message,
+        output: &mut impl Write,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        let info = message
+            .attachment
+            .as_ref()
+            .context("Dosya bilgisi bulunamadı")?;
+        ensure!(
+            (1..=MAX_BINARY_ATTACHMENT).contains(&info.bytes),
+            "Geçersiz dosya boyutu"
+        );
+        check()?;
+        if info.binary {
+            for offset in (0..info.bytes).step_by(FILE_CHUNK) {
+                check()?;
+                let chunk = self.download_chunk(identity, message.seq, offset)?;
+                ensure!(
+                    chunk.len() == (info.bytes - offset).min(FILE_CHUNK),
+                    "Dosya eksik"
+                );
+                output.write_all(&chunk)?;
+            }
+        } else {
+            let file: Attachment = self.call(
+                identity,
+                Action::Download {
+                    room: message.room,
+                    seq: message.seq,
+                },
+            )?;
+            let bytes = file.bytes()?;
+            ensure!(bytes.len() == info.bytes, "Dosya boyutu değişti");
+            output.write_all(&bytes)?;
+        }
+        check()
     }
 }

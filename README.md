@@ -34,6 +34,80 @@ Giriş ekranındaki **Beni hatırla** seçeneği, sonraki açılışta bu cihazd
 4. Otomatik karar için arkadaşlık veya grup iznini ajan ayarlarından aç ve karar kurallarını yaz. Ajan ile operatör aynı anda karar verirse host ilk kaydı korur.
 5. Ajan üye olduktan sonra salt okunur bir klasör seç. **Çalışma klasörü** bölümünde hangi sohbetten hangi kişilerin dosya incelemesi isteyebileceğini işaretle ve kaydet. Grupta `@poyraz`, alıntılı yanıt veya «Poyraz, README.md dosyasını incele» gibi doğal bir hitap kullan.
 
+### Codex görevleri ve pencere araçları
+
+Yerel Codex oturumu zaten açıksa normal istekler bu bağlantıyı geçici bir Codex çalıştırmasında kullanır; kimlik bilgileri kopyalanmaz ve Codex masaüstüne yeni sohbet eklenmez. İstersen **Görevler için OpenAI ile giriş yap** ile ayrı ve kalıcı bir görev oturumu bağlayabilirsin.
+
+Operatörü mevcut insan arkadaşların arasından eşleştir ve Codex çalışma görevlerini etkinleştir. Eşleşmiş operatörün bire bir mesajları varsayılan olarak doğrudan çalışır. Klasör seçilmezse ajana özel yerel çalışma alanı kullanılır. Masaüstü görüntüsü göndermesi açıkça istendiğinde bu tek çekim ve aynı sohbete gönderim ayrıca onay beklemez; diğer pencere eylemleri ve dosya paylaşımları kendi onaylarını korur. İstersen **Her mesaj için ayrıca çalıştırma onayı iste** seçeneğini açabilirsin.
+
+**Görev süre sınırı** yeni başlatılacak Codex işinin en uzun çalışma süresini belirler. Varsayılan 15 dakikadır. Ajan ayarlarında 1–1440 dakika seçebilirsin.
+
+Görev onayında **Codex modellerini yükle** seçeneği, kurulu Codex’in görev profiline sunduğu modelleri getirir. **Görev modeli** ve **Düşünme düzeyi** alanlarından o görev için seçim yapabilirsin. Varsayılan seçenek yeni görevde Codex ayarını, devam eden görevde mevcut oturum ayarını kullanır.
+
+**Codex becerileri → Becerileri yükle** ile seçili çalışma klasörü ve ajan profili için etkin becerileri görebilirsin. İstediğin becerileri işaretleyip **Planla** veya **Bu klasörde çalıştır** seçeneğine bas. Seçtiğin beceriler o görev adımına eklenir.
+
+Kurulu Codex'in kişisel, sistem ve eklenti skill klasörleri otomatik bulunur ve yerinde kullanılır; kopyalamak gerekmez. **Ek skill klasörleri → Skill klasörü ekle** ile başka kaynaklar tanıtılabilir. Görev panelinde beceri listesini yenile. Projedeki uygulanabilir `AGENTS.md` ve skill talimatları, onaylanan görevin ve izinlerin sınırları içinde uygulanır. Skill erişimi, gerektirdiği harici servisin bağlantısını veya oturumunu sağlamaz; bu bağlantılar ayrıca kurulmalıdır.
+
+Operatör “Masaüstünün ekran görüntüsünü at” istediğinde Codex, pencere seçmeden tüm bağlı ekranları tek seferde yakalayabilen `chatoid_desktop_image` aracını kullanır. Yerel eylem onayından sonra görüntü görev yanıtına eklenir. Kalıcı yakalama oturumu açılmaz; görüntü kaynakları çekimden hemen sonra serbest bırakılır.
+
+Görev panelindeki **MCP bağlantıları** bölümünde ajan profilindeki Codex’e tanımlı sunucuları ve sundukları araçları listeleyebilirsin. **Bu görevde listedeki MCP araçlarını kullan** seçeneğiyle çalıştırma görevine araç erişimi verebilirsin. Her çağrıda sunucu, araç adı ve JSON parametreleri ajan panelinde onaya sunulur. MCP sunucuları kendi yapılandırılmış yetkileriyle çalışır.
+
+**Yeni MCP bağlantısı** formunda bir sunucu adresi veya yerel program tanımlayabilirsin. Yerel program argümanlarını her satıra bir tane yaz. **Bağlantıyı kaydet**, yalnızca ajanın özel Codex profiline kaydeder; mevcut aynı adlı bağlantıyı değiştirmez. Ardından **Bağlantıları ve araçları listele** ile bağlan. Yerel program bu adımda başlatılır. Diğer Codex ayarları korunur.
+
+OAuth destekleyen MCP bağlantısında **Tarayıcıda giriş yap** düğmesi Codex’in hizmete giriş akışını açar. Giriş başarılı olduğunda bağlantı listesi yenilenir. Kimlik bilgileri ajanın ayrı Codex görev profiline kaydedilir.
+
+MCP araçları doğrudan görevin Codex oturumunda çalışır. Çok adımlı araçların bağlantısı görev boyunca korunur; sonuçları ve görselleri Codex'in kendi MCP işleyicisi modele iletir. ChatOid, Codex'in araç onaylarını gösterir. Görev bittiğinde veya durdurulduğunda bu oturumun yerel MCP süreçleri kapatılır.
+
+Görev onayında **Planla** seçeneği, Codex’in çalışma klasörünü salt okunur inceleyip sohbete bir plan göndermesini sağlar. Planı uygulamak için plan yanıtını alıntılayıp devam isteği gönder ve ajan uygulamasında **Bu klasörde çalıştır** seçeneğini kullan.
+
+Çalışma klasörü bir Git deposuysa, görev onayındaki **Kod incelemesi** bölümünden kaydedilmemiş değişiklikleri, bir temel dalla farkları veya bir commit’i seçebilirsin. **İncelemeyi başlat** salt okunur Codex incelemesi yapar ve bulguları sohbete gönderir.
+
+Normal mesajlar aynı sohbetin son görünür mesajlarıyla değerlendirilir. Ayrı görev oturumunda oluşturulan bir yanıtı alıntılarsan aynı yerel Codex geçmişiyle devam edilebilir. Geçici çalıştırmaların sohbet bağlamı ChatOid kayıtlarından alınır.
+
+Uzun bir göreve devam ederken **Önce Codex bağlamını sıkıştır** seçeneğini kullanabilirsin. Codex önceki bağlamı özetler ve yeni isteği aynı görev oturumunda çalıştırır.
+
+Codex kullanım verisi bildirdiğinde görev panelindeki **Token kullanımı** bölümünde oturum toplamı, girdi, önbellekten okunan girdi, çıktı ve düşünme tokenları görünür. Son model çağrısının kullanımı ayrıca gösterilir.
+
+Bir görev yanıtını alıntılayıp **Ayrı bir kolda devam et** seçeneğini işaretlersen Codex, o yanıta kadarki geçmişi yeni bir oturuma kopyalar. Kolların her birinde ilerlemek için o kolun yanıtını alıntıla. Dallandırma, Codex turu kayıtlı görev yanıtlarında kullanılabilir.
+
+Görev sürerken başlangıç mesajını alıntıla ve `/yönlendir` ile yeni talimatı yaz. Başlangıç mesajının sağ tık menüsündeki **Görevi yönlendir** bunu hazırlar. Çalışan görevi eşleşmiş operatör yönlendirebilir. Codex talimatı kabul edince sohbet, yönlendirme mesajına alıntılı bir bildirim ekler. Pencere ve dosya paylaşımı onayları geçerliliğini korur.
+
+Başlangıç mesajının menüsünden **Görev durumu** ile ilerlemeyi sorabilir, **Görevi durdur** ile çalışan görevi durdurabilir veya henüz onaylanmamış görevi iptal edebilirsin. Başlangıç mesajını alıntılayarak `/durum` ve `/durdur` komutlarını da gönderebilirsin.
+
+Kesilen veya durdurulan görev için **Yeniden onaya al** seçeneğiyle aynı isteği tekrar hazırlayabilirsin. Model ve izinleri yeniden seçip görevi onayla. Önceki denemede dosyalarda yapılmış değişiklikler çalışma klasöründe bulunabilir.
+
+Yeni görevlerde Codex oturum kimliği iş bitmeden yerel hesaba kaydedilir. Kesinti sonrasında **Devamı onaya al**, kaydedilmiş görev geçmişiyle devamı hazırlar. Uygulama yeniden açılsa da bu geçmiş korunur; görev kendiliğinden yeniden çalışmaz. Ağ, web, MCP ve pencere izinleri yeniden seçilir. Önceki komutların dosyalarda yapmış olabileceği değişiklikleri kontrol ederek devam etmesi Codex'e bildirilir.
+
+Güncel hostta başlangıç mesajının altında canlı görev durumu görünür. Ajan çalışmaya başladığında, yerel onay ya da sohbet yanıtı beklediğinde ve görev bittiğinde bu satır güncellenir. Codex bir plan bildirdiyse tamamlanan adım sayısı da görünür.
+
+Codex bir ayrıntıya ihtiyaç duyduğunda bire bir sohbete **Codex görev sorusu** gönderip üç dakika cevap bekleyebilir. Soruyu alıntılayarak yazdığın metin aynı göreve iletilir. Pencere eylemleri ve dosya paylaşımı için yerel onay akışı geçerlidir.
+
+Codex bir dosya değişikliği bildirdiğinde **Dosya değişikliklerini incele** bölümü eklenen ve çıkarılan satırları gösterir. **Komut etkinliği** son komutları, çıktı önizlemelerini ve çıkış kodlarını gösterir. Tamamlanan görevlerin planı, komutları, dosya farkı ve token kullanımı yerel hesap verisine kaydedilir ve uygulama yeniden açıldığında görüntülenebilir. Sohbetteki **Görev durumu**, Codex bir plan bildirdiyse tamamlanan adım sayısını gösterir.
+
+Bir görev mesajına dosya veya ekran görüntüsü ekleyebilirsin. Ajan sağ panelde ekin adını gösterir ve görev onayı verilene kadar eki indirmez. JPEG ve PNG görsel olarak, küçük UTF-8 dosyalar metin olarak Codex’e iletilir. Diğer dosyalar görev sırasında okunabilen geçici bir kopyayla sunulur.
+
+Yeni görevlerde «oluşturduğun dosyayı sohbete ekle» diyebilirsin. Codex’in seçtiği dosyanın adı, göreli yolu ve boyutu sağ panelde **Dosya paylaşımı** altında görünür. Dosyayı ayrıca onaylarsan görev tamamlandığında alıntılı yanıta eklenir. Güncel host 32 MiB’a kadar, ek destekleyen eski host 1 MiB’a kadar dosya kabul eder. Her görev yanıtı bir ek taşır.
+
+Windows’ta operatör görevi başlatmadan önce bu panelde bir pencere seçebilir. Pencere görüntüsü alma, tıklama, kaydırma ve metin yazma işlemleri ayrı ayrı yerel onay ister. Görüntü analizi onaylanırsa pencerenin görüntüsü Codex’e gönderilir. Pencere onayı, görüntünün sohbet eki olarak da gönderilip gönderilmeyeceğini gösterir.
+
+Yeni görevlerde Codex çalışırken ilk pencereyi veya başka bir pencereyi seçmeni isteyebilir. **Pencere araçları** bölümünde isteğin nedenini görür, açık pencerelerden birini seçer veya isteği reddedersin. Seçim görev boyunca geçerli olur. Her görüntü ve giriş eylemi ayrıca onay ister.
+
+Codex ayrıca Windows erişilebilirlik bilgilerinden görünür düğme adlarını, öğe türlerini ve konumlarını okumak için izin isteyebilir. Parola alanları ve düzenlenebilir alanların içeriği okunmaz. Okunabilen öğeler, uygulamanın Windows’a sunduğu erişilebilirlik bilgilerine bağlıdır.
+
+Yeni görevlerde Codex, son onaylı okumada bulunan bir düğmeyi fareyi hareket ettirmeden çalıştırmayı isteyebilir. Onay kartında düğmenin adı gösterilir. Onay sırasında düğme değişirse önce pencerenin yeniden okunması gerekir.
+
+Yeni görevler sağ tık, çift tık ve klavyeyle gezinmeyi de destekler. Ajan Tab ile odak değiştirebilir, Enter ile odaktaki öğeyi seçebilir ve Ctrl+F veya Ctrl+S gibi uygulama içi kısayolları kullanabilir. Bu eylemler pencere odakta kaldığı sürece uygulanır. Onay kartı gönderilecek tuşu, kısayolu veya tıklama türünü gösterir.
+
+Ajan seçili pencere içinde imleci bir öğenin üzerine götürebilir ve bir öğeyi sürükleyip bırakabilir. Sürükleme onayı başlangıç ve bitiş noktalarını gösterir. Yol başka bir pencere tarafından kapatılırsa işlem uygulanmaz.
+
+Görev onayında **Bu görevde web araştırmasına izin ver** seçeneğini işaretlersen ajan OpenAI’nin web arama aracını kullanabilir. Seçim yalnızca o görev için geçerlidir. Arama sorguları görev panelinde, kaynak bağlantıları sohbet yanıtında görünür.
+
+**Bu görev için alt ajanlara iş devret** seçeneği, Codex'in yerel alt ajan araçlarını açar. Ana ajan, onaylı çalışma klasöründeki bağımsız alt işleri devredebilir ve sonuçlarını birleştirir. Aynı anda en fazla üç alt ajan çalışacak şekilde yapılandırılır. Görev panelindeki **Alt ajanlar** bölümü adları, kayıtlı model ve düşünme düzeyini ve çalışma durumunu gösterir. Bu bilgiler yerel görev raporunda korunur. Pencere işlemleri, soru sorma, dosya paylaşımı ve MCP çağrıları ana ajan üzerinden mevcut onaylarla yürütülür. Alt ajan seçimi her görev turunda yeniden yapılır; planlama ve Git incelemesinde açılmaz.
+
+**Çalışma komutları ağ erişimi kullanabilsin** seçeneği, çalıştırma görevinde paket indirme ve ağ isteklerine izin verir. Varsayılan olarak kapalıdır. Her devam adımında yeniden seçilir ve salt okunur planlama veya kod incelemesinde uygulanmaz.
+
+Bu seçim Codex'in yerel sandbox ağ politikasına iletilir. ChatOid, Windows görevleri için `elevated` sandbox türünü seçer. Codex'in sandbox kurulumu cihazda tamamlanmış olmalıdır; kurulum başarısızsa ChatOid daha zayıf bir sandbox'a geçmez. Windows'taki yerel testte bu sandbox'ta ağ izni kapalıyken de aynı cihazdaki HTTP sunucusuna erişilebildi. Kapalı seçim tam ağ yalıtımı garantisi vermez. İndirme testi ve bu sınırı ölçen ayrı tanılama testi `tests/acceptance.rs` içindedir.
+
 İnsan parolası ve ajan özel anahtarı yerel cihazda kalır. Ajanın `.key` dosyası hesabın anahtarıdır. Sadece imzalı kişi kartını paylaş. Sohbet kayıtları hostta saklanır ve hostu çalıştıran kişi bu kayıtlara erişebilir. Codex sağlayıcısına gönderilen istek, ilgili sohbetin sınırlı bağlamını ve izinli dosya alıntılarını içerebilir.
 
 ## Derleme ve test
@@ -64,3 +138,12 @@ python tools/package.py verify
 ```
 
 `windows` ve `linux` komutları, o platformda üretilen `target/release` dosyalarını kullanır. İki platformun arşivlerini aynı `dist` dizininde birleştirip SHA-256 listesini oluştur. GitHub Actions, `v0.1.0` gibi bir sürüm etiketi gönderildiğinde iki platformda derler, test eder ve doğrulanmış dağıtım çıktısını saklar.
+
+### Komut menüsü, döngüler ve hedefler
+
+Mesaj kutusunda `/` yazınca yalnızca `/loop` ve `/goal` seçenekleri, açıklama ve simgeleriyle açılır. Yukarı/aşağı ok ve Enter ile seçilebilir; Escape kapatır.
+
+- `/loop 1h <iş>`: işi her saatte bir çalıştırır. `10s`, `30m`, `1h`, `1d` veya `saatlik` kullanılabilir. `/loop list` kayıtları gösterir, `/loop stop <kimlik>` durdurur. Uygulama ve sohbet hostu açıkken çalışır; yeniden açılınca kaçırılan aralıklar topluca çalıştırılmaz.
+- `/goal <hedef>`: hedefe ulaşılana kadar ilerlemeyi kaydederek çalışır. `/goal status` durumunu gösterir; `/goal stop` durdurur, `/goal resume` devam ettirir. Tamamlanma kararı yapılandırılmış Codex araç sonucundan gelir. Üç ardışık ilerlemesiz denemede engellendi durumuna geçer.
+
+Döngü ve hedefler hesaba ve sohbete bağlıdır; başka bir kişi bunları yönetemez. Operatör, üyelik ve host bağlantısı her çalıştırmada tekrar doğrulanır.

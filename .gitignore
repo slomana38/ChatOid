@@ -1,4 +1,5 @@
 /target/
+/graphify-out/
 /dist/
 /data/
 *.key

@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL REFERENCES rooms(id),
   actor TEXT NOT NULL REFERENCES profiles(id), client_id TEXT NOT NULL, time INTEGER NOT NULL,
   payload TEXT NOT NULL, reply INTEGER REFERENCES messages(seq), root INTEGER REFERENCES messages(seq),
+  sent_ms INTEGER NOT NULL DEFAULT 0, undo_deadline_ms INTEGER NOT NULL DEFAULT 0,
+  withdrawn INTEGER NOT NULL DEFAULT 0,
   UNIQUE(actor, client_id));
 CREATE INDEX IF NOT EXISTS room_messages ON messages(room, seq);
 CREATE UNIQUE INDEX IF NOT EXISTS source_agent_reply ON messages(actor, reply) WHERE root IS NOT NULL;
@@ -73,6 +75,12 @@ CREATE TABLE IF NOT EXISTS delivery (actor TEXT PRIMARY KEY REFERENCES profiles(
 CREATE TABLE IF NOT EXISTS reads (
   actor TEXT NOT NULL REFERENCES profiles(id), room TEXT NOT NULL REFERENCES rooms(id),
   seq INTEGER NOT NULL, PRIMARY KEY(actor, room));
+CREATE TABLE IF NOT EXISTS task_activity (
+  source INTEGER PRIMARY KEY REFERENCES messages(seq), room TEXT NOT NULL REFERENCES rooms(id),
+  agent TEXT NOT NULL REFERENCES profiles(id), recipient TEXT NOT NULL REFERENCES profiles(id),
+  updated INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS activity_recipient ON task_activity(recipient, updated);
+CREATE INDEX IF NOT EXISTS activity_expiry ON task_activity(updated);
 ";
 
 const VISIBLE: &str = "
@@ -108,6 +116,7 @@ impl Host {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
+        ensure_message_columns(&db)?;
         let binding: Option<(String, String)> = db
             .query_row("SELECT owner,pin FROM host", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -195,6 +204,11 @@ impl Host {
         let db = connection.transaction()?;
         let id = &actor.data.key;
         let value = match action {
+            Action::PublishTaskActivity { activity } => {
+                ensure!(actor.data.role == Role::Agent, "Ajan hesabı gerekli");
+                publish_task_activity(&db, id, activity)?;
+                Value::Null
+            }
             Action::Sync {
                 after,
                 grants,
@@ -261,13 +275,60 @@ impl Host {
             } => self.redeem(&db, id, request, &code, grant.as_ref())?,
             Action::Decide { decision } => self.decide(&db, id, decision)?,
             Action::Send { draft } => serde_json::to_value(send(&db, actor, draft, None)?)?,
+            Action::WithdrawMessage { room, seq } => {
+                ensure!(seq > 0, "Mesaj bulunamadı");
+                let (author, room_id, deadline, withdrawn): (String, String, i64, bool) = db
+                    .query_row(
+                        "SELECT actor,room,undo_deadline_ms,withdrawn FROM messages WHERE seq=?1",
+                        [seq],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?
+                    .context("Mesaj bulunamadı")?;
+                ensure!(
+                    author == *id && room_id == room.to_string(),
+                    "Yalnızca kendi mesajını geri alabilirsin"
+                );
+                ensure!(visible(&db, id, seq)?, "Mesaja erişim yok");
+                if !withdrawn {
+                    ensure!(now_ms() <= deadline, "Mesajı geri alma süresi doldu");
+                    let raw: String =
+                        db.query_row("SELECT payload FROM messages WHERE seq=?1", [seq], |r| {
+                            r.get(0)
+                        })?;
+                    let mut draft: Draft = serde_json::from_str(&raw)?;
+                    draft.text.clear();
+                    draft.mode = None;
+                    draft.attachment = None;
+                    draft.invitation = None;
+                    db.execute(
+                        "UPDATE messages SET withdrawn=1,payload=?2 WHERE seq=?1",
+                        params![seq, serde_json::to_string(&draft)?],
+                    )?;
+                    db.execute("DELETE FROM binary_files WHERE seq=?1", [seq])?;
+                    db.execute("DELETE FROM attachment_previews WHERE seq=?1", [seq])?;
+                    db.execute("DELETE FROM attachments WHERE seq=?1", [seq])?;
+                }
+                Value::Null
+            }
+            Action::CanProcessMessage { room, seq } => {
+                ensure!(actor.data.role == Role::Agent, "Ajan hesabı gerekli");
+                let eligible: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages s JOIN rooms r ON r.id=s.room
+                     WHERE s.seq=?1 AND s.room=?2 AND s.withdrawn=0 AND s.undo_deadline_ms<?3
+                       AND r.closed=0 AND s.actor<>?4
+                       AND EXISTS(SELECT 1 FROM members a WHERE a.room=s.room AND a.actor=?4 AND a.through_seq IS NULL AND s.seq>a.after_seq)
+                       AND EXISTS(SELECT 1 FROM members h WHERE h.room=s.room AND h.actor=s.actor AND h.through_seq IS NULL AND s.seq>h.after_seq))",
+                    params![seq, room.to_string(), now_ms(), id], |r| r.get(0),
+                )?;
+                json!(eligible)
+            }
             Action::SendBinary {
                 draft,
                 name,
                 bytes,
                 hash,
             } => {
-                ensure!(actor.data.role == Role::Human, "İnsan hesabı gerekli");
                 check_filename(&name)?;
                 ensure!(
                     draft.attachment.is_none()
@@ -286,6 +347,7 @@ impl Host {
             }
             Action::Download { room, seq } => {
                 ensure!(visible(&db, id, seq)?, "Dosyaya erişim yok");
+                ensure!(!is_withdrawn(&db, seq)?, "Geri alınan mesaja erişilemiyor");
                 let file = db.query_row(
                     "SELECT a.name,a.data FROM attachments a JOIN messages m ON m.seq=a.seq WHERE m.room=?1 AND m.seq=?2",
                     params![room.to_string(), seq],
@@ -815,18 +877,125 @@ impl Host {
         } else {
             vec![]
         };
+        let task_activity = {
+            let mut statement = db.prepare(
+                "SELECT a.data FROM task_activity a JOIN rooms r ON r.id=a.room
+                 WHERE a.recipient=?1 AND a.updated>?2 AND r.closed=0 AND EXISTS
+                   (SELECT 1 FROM members m WHERE m.room=a.room AND m.actor=a.recipient AND m.through_seq IS NULL)
+                   AND EXISTS (SELECT 1 FROM members m WHERE m.room=a.room AND m.actor=a.agent AND m.through_seq IS NULL)
+                 ORDER BY a.updated DESC, a.source DESC LIMIT 64",
+            )?;
+            statement
+                .query_map(params![actor, now() - 75], |row| row.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let withdrawn_messages = {
+            let mut statement = db.prepare(&format!(
+                "SELECT seq FROM messages WHERE withdrawn=1 AND {VISIBLE} ORDER BY seq"
+            ))?;
+            statement
+                .query_map([actor], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?
+        };
         Ok(json!(Sync {
             cursor,
             rooms,
             requests,
             messages,
+            withdrawn_messages,
+            supports_message_modes: true,
             receipts,
             supports_attachments: true,
             avatar_index,
             introductions,
             max_file_bytes: MAX_BINARY_ATTACHMENT,
+            agent_binary_files: true,
+            supports_task_activity: true,
+            task_activity,
         }))
     }
+}
+
+fn ensure_message_columns(db: &Connection) -> Result<()> {
+    let columns = {
+        let mut statement = db.prepare("PRAGMA table_info(messages)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?
+    };
+    if !columns.contains("sent_ms") {
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN sent_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("undo_deadline_ms") {
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN undo_deadline_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("withdrawn") {
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    db.execute(
+        "UPDATE messages SET sent_ms=time*1000,undo_deadline_ms=time*1000 WHERE sent_ms=0",
+        [],
+    )?;
+    Ok(())
+}
+
+fn is_withdrawn(db: &Connection, seq: i64) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT withdrawn FROM messages WHERE seq=?1",
+        [seq],
+        |row| row.get(0),
+    )?)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn publish_task_activity(db: &Connection, agent: &str, activity: TaskActivity) -> Result<()> {
+    ensure!(
+        activity.source > 0
+            && activity
+                .plan
+                .is_none_or(|[done, total]| total > 0 && done <= total),
+        "Geçersiz görev durumu"
+    );
+    let room = activity.room.to_string();
+    let (recipient, card): (String, String) = db.query_row(
+        "SELECT s.actor, p.card FROM messages s JOIN rooms r ON r.id=s.room JOIN profiles p ON p.id=s.actor
+         WHERE s.seq=?1 AND s.room=?2 AND r.is_group=0 AND r.closed=0 AND s.actor<>?3
+           AND EXISTS (SELECT 1 FROM members m WHERE m.room=s.room AND m.actor=?3 AND s.seq>m.after_seq AND m.through_seq IS NULL)
+           AND EXISTS (SELECT 1 FROM members m WHERE m.room=s.room AND m.actor=s.actor AND s.seq>m.after_seq AND m.through_seq IS NULL)",
+        params![activity.source, room, agent],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?.context("Görev mesajına erişim yok")?;
+    ensure!(
+        serde_json::from_str::<Card>(&card)?.data.role == Role::Human,
+        "Görev durumu insan hesabına iletilir"
+    );
+    let timestamp = now();
+    db.execute(
+        "DELETE FROM task_activity WHERE updated<=?1",
+        [timestamp - 75],
+    )?;
+    db.execute(
+        "INSERT INTO task_activity(source,room,agent,recipient,updated,data) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(source) DO UPDATE SET updated=excluded.updated,data=excluded.data",
+        params![activity.source, room, agent, recipient, timestamp, serde_json::to_string(&activity)?],
+    )?;
+    Ok(())
 }
 
 fn remember(db: &Connection, card: &Card) -> Result<()> {
@@ -1063,15 +1232,18 @@ fn attachment_preview(bytes: &[u8]) -> Result<Option<AttachmentPreview>> {
 }
 
 fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
-    let (id, author, raw, sent_at, reply, root): (
+    let (id, author, raw, sent_at, reply, root, sent_ms, undo_until_ms, withdrawn): (
         String,
         String,
         String,
         i64,
         Option<i64>,
         Option<i64>,
+        i64,
+        i64,
+        bool,
     ) = db.query_row(
-        "SELECT room,actor,payload,time,reply,root FROM messages WHERE seq=?1",
+        "SELECT room,actor,payload,time,reply,root,sent_ms,undo_deadline_ms,withdrawn FROM messages WHERE seq=?1",
         [seq],
         |r| {
             Ok((
@@ -1081,13 +1253,18 @@ fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
             ))
         },
     )?;
     let draft: Draft = serde_json::from_str(&raw)?;
     let mut quote = None;
-    if let Some(source) = reply.filter(|source| *source != seq)
+    if !withdrawn
+        && let Some(source) = reply.filter(|source| *source != seq)
         && visible(db, viewer, source)?
+        && !is_withdrawn(db, source)?
     {
         let (author, payload): (String, String) = db.query_row(
             "SELECT actor,payload FROM messages WHERE seq=?1",
@@ -1105,17 +1282,25 @@ fn message(db: &Connection, viewer: &str, seq: i64) -> Result<Message> {
             },
         });
     }
+    let withdrawn_attachment = if withdrawn {
+        None
+    } else {
+        attachment_info(db, seq)?
+    };
     Ok(Message {
         seq,
         room: Uuid::parse_str(&id)?,
         author: profile(db, &author)?,
         client_id: draft.id,
-        text: draft.text,
+        text: if withdrawn { String::new() } else { draft.text },
         sent_at,
         reply: quote,
         root,
-        invitation: draft.invitation,
-        attachment: attachment_info(db, seq)?,
+        invitation: if withdrawn { None } else { draft.invitation },
+        withdrawn,
+        undo_until_ms: if sent_ms == 0 { 0 } else { undo_until_ms },
+        mode: if withdrawn { None } else { draft.mode },
+        attachment: withdrawn_attachment,
     })
 }
 
@@ -1141,6 +1326,22 @@ fn send(
     } else {
         clean(&draft.text, MAX_TEXT)?
     };
+    if let Some(mode) = &draft.mode {
+        ensure!(
+            actor.data.role == Role::Human,
+            "Otomasyon modunu yalnızca insan hesabı seçebilir"
+        );
+        ensure!(
+            !draft.text.trim().is_empty(),
+            "Otomasyon yönergesi boş olamaz"
+        );
+        if let MessageMode::Loop { interval_seconds } = mode {
+            ensure!(
+                (10..=30 * 24 * 60 * 60).contains(interval_seconds),
+                "Döngü aralığı 10 saniye ile 30 gün arasında olmalı"
+            );
+        }
+    }
     let payload = serde_json::to_string(&draft)?;
     let existing: Option<(i64, String)> = db
         .query_row(
@@ -1150,6 +1351,9 @@ fn send(
         )
         .optional()?;
     if let Some((seq, original)) = existing {
+        if is_withdrawn(db, seq)? {
+            return message(db, author, seq);
+        }
         if let Some(expected) = binary {
             let saved = db.query_row("SELECT a.name,a.bytes,b.hash FROM attachments a JOIN binary_files b USING(seq) WHERE seq=?1",
                 [seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?, r.get::<_, String>(2)?))).optional()?;
@@ -1182,6 +1386,17 @@ fn send(
         !closed && active_member(db, draft.room, author)?,
         "Sohbete gönderme yetkisi yok"
     );
+    if binary.is_some() && actor.data.role == Role::Agent {
+        let source = draft
+            .reply
+            .context("Ajan dosyası bir insan mesajına yanıt olmalı")?;
+        ensure!(
+            !group
+                && visible(db, author, source)?
+                && message(db, author, source)?.author.data.role == Role::Human,
+            "Ajan dosyaları bire bir insan sohbetlerinde gönderilebilir"
+        );
+    }
     if let Some(ticket) = &draft.invitation {
         ensure!(
             !group && actor.data.role == Role::Human && ticket.grant.is_none(),
@@ -1237,8 +1452,9 @@ fn send(
             root = Some(chain);
         }
     }
-    db.execute("INSERT INTO messages(room,actor,client_id,time,payload,reply,root) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![draft.room.to_string(),author,draft.id.to_string(),now(),payload,draft.reply,root])?;
+    let sent_ms = now_ms();
+    db.execute("INSERT INTO messages(room,actor,client_id,time,payload,reply,root,sent_ms,undo_deadline_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![draft.room.to_string(),author,draft.id.to_string(),sent_ms / 1000,payload,draft.reply,root,sent_ms,sent_ms + 500])?;
     let seq = db.last_insert_rowid();
     if let Some(file) = attachment {
         db.execute(
@@ -1388,13 +1604,19 @@ async fn upload(
         .ok_or_else(|| Failure(StatusCode::UNAUTHORIZED, "Oturum geçersiz".into()))?;
     blocking(move || {
         ensure!(
-            actor.data.role == Role::Human
-                && offset.is_multiple_of(FILE_CHUNK)
+            offset.is_multiple_of(FILE_CHUNK)
                 && (1..=FILE_CHUNK).contains(&chunk.len())
                 && offset <= MAX_BINARY_ATTACHMENT - chunk.len(),
             "Geçersiz dosya parçası"
         );
         let db = host.db.lock().expect("database lock");
+        if actor.data.role == Role::Agent {
+            let direct: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM members m JOIN rooms r ON r.id=m.room WHERE m.actor=?1 AND m.through_seq IS NULL AND r.is_group=0 AND r.closed=0)",
+                [&actor.data.key], |row| row.get(0),
+            )?;
+            ensure!(direct, "Ajan dosyası için açık bire bir sohbet gerekli");
+        }
         let id = id.to_string();
         let published: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE actor=?1 AND client_id=?2)",

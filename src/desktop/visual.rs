@@ -108,22 +108,22 @@ pub struct Palette {
 pub fn palette(role: Role) -> Palette {
     let colors = match role {
         Role::Human => [
-            [13, 20, 22],
-            [18, 32, 32],
-            [25, 43, 41],
-            [46, 76, 68],
+            [20, 23, 25],
+            [27, 31, 33],
+            [35, 40, 42],
+            [53, 62, 64],
             crate::branding::accent(false),
-            [34, 70, 60],
-            [26, 49, 44],
+            [39, 67, 59],
+            [29, 35, 36],
         ],
         Role::Agent => [
-            [21, 18, 33],
-            [31, 26, 48],
-            [43, 36, 62],
-            [76, 64, 105],
+            [23, 22, 27],
+            [31, 29, 36],
+            [41, 38, 47],
+            [61, 56, 72],
             crate::branding::accent(true),
-            [62, 49, 93],
-            [49, 40, 71],
+            [60, 51, 76],
+            [35, 32, 42],
         ],
     };
     let [base, panel, raised, border, accent, tint, chrome] =
@@ -584,7 +584,7 @@ pub fn chat_row(
 pub fn chat_background(ui: &Ui, rect: Rect) {
     let colors = current(ui.ctx());
     let paint = ui.painter_at(rect);
-    let dot = colors.border.gamma_multiply(0.38);
+    let dot = colors.border.gamma_multiply(0.16);
     for y in 1..(rect.height() / 28.) as u32 {
         for x in 1..(rect.width() / 28.) as u32 {
             let position = rect.min
@@ -752,11 +752,12 @@ pub fn bubble_lane(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.;
         let mut reply = false;
+        let mut reply_button = None;
         if mine {
             let action_width = if replies { 28. } else { 0. };
             ui.add_space((width - size.width - BUBBLE_PADDING * 2. - action_width - 6.).max(0.));
             if replies {
-                reply = chat_icon_button(ui, false, true).clicked();
+                reply_button = Some(chat_button(ui, false, true, false));
             }
         }
         let frame = egui::Frame::new()
@@ -777,7 +778,16 @@ pub fn bubble_lane(
                 });
             });
         if !mine && replies {
-            reply = chat_icon_button(ui, false, true).clicked();
+            reply_button = Some(chat_button(ui, false, true, false));
+        }
+        if let Some(button) = reply_button {
+            let hovered = ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|position| frame.response.rect.union(button.rect).contains(position));
+            if hovered || button.has_focus() {
+                paint_chat_icon(ui, &button, false, true);
+            }
+            reply = button.clicked();
         }
         (frame.response, reply)
     })
@@ -896,6 +906,71 @@ pub fn profile_section(ui: &mut Ui, icon: Outline, title: &str, draw: impl FnOnc
         });
 }
 
+pub fn profile_action(
+    ui: &mut Ui,
+    icon: Outline,
+    title: &str,
+    detail: &str,
+    expanded: bool,
+) -> egui::Response {
+    let colors = current(ui.ctx());
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 53.), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+    let painter = ui.painter();
+    let active = response.hovered() || response.has_focus() || expanded;
+    if active {
+        painter.rect_filled(rect, 10., colors.raised);
+    }
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            10.,
+            Stroke::new(1_f32, colors.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let center = rect.left_center() + vec2(21., 0.);
+    painter.rect_filled(
+        Rect::from_center_size(center, Vec2::splat(29.)),
+        9.,
+        colors.tint,
+    );
+    outline(
+        painter,
+        icon,
+        Rect::from_center_size(center, Vec2::splat(18.)),
+        colors.accent,
+    );
+    for (text, size, vertical_offset, ink) in [(title, 13.5, -16., INK), (detail, 11.5, 3., MUTED)]
+    {
+        let mut layout = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            FontId::proportional(size),
+            ink,
+            (width - 77.).max(20.),
+        );
+        layout.wrap.max_rows = 1;
+        let caption = ui.fonts_mut(|fonts| fonts.layout_job(layout));
+        painter.galley(
+            pos2(rect.left() + 46., rect.center().y + vertical_offset),
+            caption,
+            ink,
+        );
+    }
+    let caret = rect.right_center() - vec2(14., 0.);
+    let points = if expanded {
+        [vec2(1.5, -3.5), vec2(-2., 0.), vec2(1.5, 3.5)]
+    } else {
+        [vec2(-1.5, -3.5), vec2(2., 0.), vec2(-1.5, 3.5)]
+    };
+    painter.add(Shape::line(
+        points.map(|point| caret + point).to_vec(),
+        Stroke::new(1.25_f32, if active { colors.accent } else { MUTED }),
+    ));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub fn account_menu(ui: &mut Ui, name: &str, contents: impl FnOnce(&mut Ui)) {
     let colors = current(ui.ctx());
     let caption = ui
@@ -960,17 +1035,17 @@ pub fn attachment_preview(
     ui: &mut Ui,
     preview: &crate::protocol::AttachmentPreview,
     key: impl std::hash::Hash,
-) {
+) -> Option<egui::Response> {
     if !(1..=crate::protocol::AttachmentPreview::MAX_DIMENSION).contains(&preview.width)
         || !(1..=crate::protocol::AttachmentPreview::MAX_DIMENSION).contains(&preview.height)
     {
-        return;
+        return None;
     }
     let width = (preview.width as f32).min(ui.available_width());
     let height = width * preview.height as f32 / preview.width as f32;
-    let (rect, _) = ui.allocate_exact_size(vec2(width, height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
-        return;
+        return Some(response);
     }
     let cache = egui::Id::new(("attachment-preview", key));
     let texture = ui
@@ -999,6 +1074,11 @@ pub fn attachment_preview(
             Color32::WHITE,
         );
     }
+    Some(
+        response
+            .on_hover_text("Resmi büyük görüntüle")
+            .on_hover_cursor(egui::CursorIcon::ZoomIn),
+    )
 }
 
 pub fn participant_color(key: &str) -> Color32 {
@@ -1082,11 +1162,15 @@ pub fn bubble_text(
 }
 
 pub fn chat_icon_button(ui: &mut Ui, send: bool, enabled: bool) -> egui::Response {
+    chat_button(ui, send, enabled, true)
+}
+
+fn chat_button(ui: &mut Ui, send: bool, enabled: bool, draw: bool) -> egui::Response {
     let colors = current(ui.ctx());
     let (size, label) = if send {
         (36., "Gönder")
     } else {
-        (23., "Yanıtla")
+        (28., "Yanıtla")
     };
     let response = ui.add_enabled(
         enabled,
@@ -1102,16 +1186,26 @@ pub fn chat_icon_button(ui: &mut Ui, send: bool, enabled: bool) -> egui::Respons
             .corner_radius(if send { 10 } else { 6 }),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if draw {
+        paint_chat_icon(ui, &response, send, enabled);
+    }
+    response
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn paint_chat_icon(ui: &Ui, response: &egui::Response, send: bool, enabled: bool) {
+    let colors = current(ui.ctx());
     let center = response.rect.center();
     let ink = if send {
         colors.base
     } else if response.hovered() || response.has_focus() {
         colors.accent
     } else {
-        MUTED
+        INK
     };
     let stroke = Stroke::new(
-        1.35_f32,
+        1.8_f32,
         if enabled {
             ink
         } else {
@@ -1121,7 +1215,7 @@ pub fn chat_icon_button(ui: &mut Ui, send: bool, enabled: bool) -> egui::Respons
     let coordinates = if send {
         [vec2(-7., -6.), vec2(7., 0.), vec2(-7., 6.), vec2(-4., 0.)]
     } else {
-        [vec2(-5., -1.), vec2(6., -1.), vec2(6., 4.), vec2(6., 4.)]
+        [vec2(-7., -2.), vec2(1., -2.), vec2(5., 1.), vec2(5., 6.)]
     };
     ui.painter().add(Shape::line(
         coordinates.iter().map(|offset| center + *offset).collect(),
@@ -1130,19 +1224,19 @@ pub fn chat_icon_button(ui: &mut Ui, send: bool, enabled: bool) -> egui::Respons
     let arrow = if send {
         [vec2(-4., 0.), vec2(1., 0.), vec2(7., 0.)]
     } else {
-        [vec2(-1., -5.), vec2(-5., -1.), vec2(-1., 3.)]
+        [vec2(-2., -7.), vec2(-7., -2.), vec2(-2., 3.)]
     };
     ui.painter().add(Shape::line(
         arrow.iter().map(|offset| center + *offset).collect(),
         stroke,
     ));
-    response
-        .on_hover_text(label)
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[derive(Clone, Copy)]
 pub enum Outline {
+    Edit,
+    Loop,
+    Goal,
     Settings,
     Chat,
     Archive,
@@ -1183,6 +1277,27 @@ fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
         );
     };
     match icon {
+        Outline::Loop => {
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.32, line);
+            trace(&[(0.63, 0.18), (0.80, 0.18), (0.80, 0.35)]);
+            trace(&[(0.37, 0.82), (0.20, 0.82), (0.20, 0.65)]);
+        }
+        Outline::Goal => {
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.34, line);
+            paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.20, line);
+            paint.circle_filled(at(0.50, 0.50), rect.width() * 0.055, ink);
+        }
+        Outline::Edit => {
+            trace(&[
+                (0.19, 0.79),
+                (0.25, 0.53),
+                (0.69, 0.13),
+                (0.87, 0.32),
+                (0.41, 0.74),
+                (0.19, 0.79),
+            ]);
+            trace(&[(0.60, 0.23), (0.77, 0.42)]);
+        }
         Outline::Chat => {
             trace(&[
                 (0.20, 0.81),
@@ -1285,20 +1400,17 @@ fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
             trace(&[(0.75, 0.25), (0.25, 0.75)]);
         }
         Outline::Attachment => trace(&[
-            (0.63, 0.32),
-            (0.63, 0.73),
-            (0.56, 0.83),
-            (0.41, 0.83),
-            (0.29, 0.72),
-            (0.29, 0.28),
-            (0.39, 0.16),
-            (0.54, 0.16),
-            (0.75, 0.29),
-            (0.75, 0.72),
-            (0.60, 0.93),
-            (0.35, 0.93),
-            (0.18, 0.73),
-            (0.18, 0.28),
+            (0.40, 0.62),
+            (0.68, 0.34),
+            (0.68, 0.24),
+            (0.60, 0.19),
+            (0.51, 0.23),
+            (0.23, 0.51),
+            (0.18, 0.65),
+            (0.22, 0.78),
+            (0.35, 0.83),
+            (0.48, 0.78),
+            (0.80, 0.46),
         ]),
         Outline::Emoji => {
             paint.circle_stroke(at(0.50, 0.50), rect.width() * 0.36, line);
@@ -1308,6 +1420,53 @@ fn outline(paint: &egui::Painter, icon: Outline, rect: Rect, ink: Color32) {
             trace(&[(0.34, 0.60), (0.43, 0.69), (0.57, 0.69), (0.66, 0.60)]);
         }
     }
+}
+
+pub fn slash_command_suggestion(
+    ui: &mut Ui,
+    icon: Outline,
+    command: &str,
+    description: &str,
+    selected: bool,
+) -> egui::Response {
+    let colors = current(ui.ctx());
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 48.), egui::Sense::click());
+    let active = selected || response.hovered() || response.has_focus();
+    if active {
+        ui.painter().rect_filled(rect, 8., colors.raised);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            8.,
+            Stroke::new(1_f32, colors.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let badge = Rect::from_center_size(pos2(rect.left() + 22., rect.center().y), Vec2::splat(28.));
+    ui.painter().rect_filled(badge, 8., colors.tint);
+    outline(
+        ui.painter(),
+        icon,
+        Rect::from_center_size(badge.center(), Vec2::splat(17.)),
+        colors.accent,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 45., rect.top() + 8.),
+        egui::Align2::LEFT_TOP,
+        command,
+        FontId::proportional(13.5),
+        INK,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 45., rect.top() + 27.),
+        egui::Align2::LEFT_TOP,
+        description,
+        FontId::proportional(11.5),
+        MUTED,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn small_icon(ui: &mut Ui, icon: Outline) {
@@ -1379,19 +1538,40 @@ pub fn avatar_option(ui: &mut Ui, index: usize, selected: bool) -> egui::Respons
 }
 
 pub fn composer_popup(ui: &mut Ui, icon: Outline, label: &str, contents: impl FnOnce(&mut Ui)) {
-    let button = ui.menu_button("", contents).response;
+    let button = composer_button(ui, icon, label, false);
+    egui::Popup::menu(&button).show(contents);
+}
+
+pub fn composer_button(ui: &mut Ui, icon: Outline, label: &str, active: bool) -> egui::Response {
+    let colors = current(ui.ctx());
+    let button = ui.add_sized(
+        [36., 36.],
+        egui::Button::new("")
+            .frame(false)
+            .fill(if active {
+                colors.tint
+            } else {
+                Color32::TRANSPARENT
+            })
+            .corner_radius(9),
+    );
+    if button.hovered() {
+        ui.painter().rect_filled(button.rect, 9., colors.raised);
+    }
     outline(
         ui.painter(),
         icon,
-        Rect::from_center_size(button.rect.center(), Vec2::splat(19.)),
-        if button.hovered() {
-            current(ui.ctx()).accent
+        Rect::from_center_size(button.rect.center(), Vec2::splat(23.)),
+        if button.hovered() || active {
+            colors.accent
         } else {
-            MUTED
+            INK
         },
     );
     button.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-    button.on_hover_text(label);
+    button
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn label_icon(ui: &mut Ui, icon: Outline, text: RichText) {
@@ -1441,7 +1621,9 @@ pub fn page_heading(ui: &mut Ui, icon: Outline, title: &str, detail: &str) {
         outline(ui.painter(), icon, rect, current(ui.ctx()).accent);
         ui.heading(RichText::new(title).size(30.).strong());
     });
-    ui.label(RichText::new(detail).size(14.).color(MUTED));
+    if !detail.is_empty() {
+        ui.label(RichText::new(detail).size(14.).color(MUTED));
+    }
     ui.add_space(15.);
 }
 
