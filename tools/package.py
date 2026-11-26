@@ -33,7 +33,8 @@ def source_files():
     return sorted(ROOT.glob("src/**/*.rs")) + sorted(ROOT.glob("tests/*.rs")) + [
         ROOT / name
         for name in (*DOCS, "Cargo.toml", "Cargo.lock", "build.rs", ".gitignore", ".gitattributes", "tools/package.py",
-                     ".github/workflows/release.yml")
+                     "tools/install-linux.py", "tests/test_linux_installer.py", "assets/icons/chatoid.svg",
+                     "assets/icons/chatoid-agent.svg", ".github/workflows/release.yml")
     ]
 
 
@@ -72,6 +73,13 @@ def package(platform, out, binaries):
                 entry.mode = 0o755
                 with (binaries / name).open("rb") as file:
                     target.addfile(entry, file)
+            installer = ROOT / "tools/install-linux.py"
+            entry = target.gettarinfo(str(installer), f"{archive_root}/install-linux.py")
+            entry.mode = 0o755
+            with installer.open("rb") as file:
+                target.addfile(entry, file)
+            for name in ("chatoid.svg", "chatoid-agent.svg"):
+                target.add(ROOT / "assets/icons" / name, f"{archive_root}/icons/{name}")
 
 
 def inspect_archive(platform, path):
@@ -86,7 +94,8 @@ def inspect_archive(platform, path):
                    for file in source_files()):
                 raise ValueError("Source package differs from the checkout")
         return
-    expected = sorted(f"{prefix}/{name}" for name in (*DOCS, *BINARIES[platform]))
+    extra = ("install-linux.py", "icons/chatoid.svg", "icons/chatoid-agent.svg") if platform == "linux" else ()
+    expected = sorted(f"{prefix}/{name}" for name in (*DOCS, *BINARIES[platform], *extra))
     if platform == "windows":
         with ZipFile(path) as archive:
             if sorted(archive.namelist()) != expected:
@@ -107,6 +116,14 @@ def inspect_archive(platform, path):
                 check_binary(archive.extractfile(entry).read(), platform)
             for name in DOCS:
                 if archive.extractfile(f"{prefix}/{name}").read() != (ROOT / name).read_bytes():
+                    raise ValueError(f"Unexpected Linux copy of {name}")
+            installer = archive.getmember(f"{prefix}/install-linux.py")
+            if installer.mode & 0o111 == 0:
+                raise ValueError("install-linux.py lacks execute permission")
+            if archive.extractfile(installer).read() != (ROOT / "tools/install-linux.py").read_bytes():
+                raise ValueError("Unexpected Linux installer")
+            for name in ("chatoid.svg", "chatoid-agent.svg"):
+                if archive.extractfile(f"{prefix}/icons/{name}").read() != (ROOT / "assets/icons" / name).read_bytes():
                     raise ValueError(f"Unexpected Linux copy of {name}")
 
 

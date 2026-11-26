@@ -151,23 +151,29 @@ pub fn check_filename(name: &str) -> Result<()> {
             && !name.ends_with(['.', ' ']),
         "Geçersiz dosya adı"
     );
+    let basename = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
+    let upper = basename.to_ascii_uppercase();
+    let device_number = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"));
+    let reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || matches!(
+        device_number,
+        Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+    );
+    ensure!(!reserved, "Geçersiz dosya adı");
     Ok(())
 }
 
 impl Attachment {
     pub fn bytes(&self) -> Result<Vec<u8>> {
-        ensure!(
-            !self.name.trim().is_empty()
-                && self.name.chars().count() <= 120
-                && self.name != "."
-                && self.name != ".."
-                && !self
-                    .name
-                    .chars()
-                    .any(|c| c.is_control() || "/\\:<>|\"?*".contains(c))
-                && !self.name.ends_with(['.', ' ']),
-            "Geçersiz dosya adı"
-        );
+        check_filename(&self.name)?;
         ensure!(
             self.data.len() <= MAX_ATTACHMENT.div_ceil(3) * 4,
             "Dosya 1 MiB sınırını aşıyor"
@@ -661,4 +667,44 @@ pub fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_filenames_exclude_dos_devices() -> Result<()> {
+        for name in [
+            "con",
+            "Nul.tar.gz",
+            "PRN .txt",
+            "aUX.png",
+            "CoM9.zip",
+            "lpt³.log",
+            "CONOUT$",
+        ] {
+            assert!(check_filename(name).is_err(), "{name}");
+            assert!(
+                Attachment {
+                    name: name.into(),
+                    data: "YQ".into()
+                }
+                .bytes()
+                .is_err(),
+                "{name}"
+            );
+        }
+        for name in [".profile", "console.txt", "COM10.txt", "rapor.pdf"] {
+            assert_eq!(
+                Attachment {
+                    name: name.into(),
+                    data: "YQ".into()
+                }
+                .bytes()?,
+                b"a"
+            );
+        }
+        Ok(())
+    }
 }

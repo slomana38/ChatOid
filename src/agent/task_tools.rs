@@ -21,6 +21,10 @@ use uuid::Uuid;
 use super::app_server::{TaskResult, tool_text};
 use crate::protocol::check_filename;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_desktop_text.rs"]
+mod linux_desktop_text;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Approval {
     pub id: Uuid,
@@ -52,25 +56,26 @@ pub struct GoalUpdate {
     pub progress: String,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowRequest {
     pub id: Uuid,
     pub reason: String,
 }
 
-#[cfg(windows)]
-type WindowChoice = Option<super::desktop_tools::Target>;
+#[cfg(any(windows, target_os = "linux"))]
+type WindowChoice = Option<super::window_tools::Target>;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 pub struct DesktopRequest {
+    #[cfg(windows)]
     pub reveal: bool,
     pub text_file: bool,
     pub image_before_text: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub struct DesktopDelivery {
     pub image: Vec<u8>,
     pub reply: mpsc::SyncSender<Result<()>>,
@@ -85,19 +90,19 @@ pub struct TaskTools {
     requested_desktop_capture: AtomicBool,
     goal_progress_enabled: AtomicBool,
     goal_update: Mutex<Option<GoalUpdate>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     window: Mutex<WindowChoice>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) window_buttons: Mutex<std::collections::BTreeMap<String, String>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     window_request: Mutex<Option<(WindowRequest, mpsc::SyncSender<WindowChoice>)>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) desktop_request: DesktopRequest,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     desktop_delivery: Mutex<Option<DesktopDelivery>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     desktop_delivered: AtomicBool,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) desktop_file: Mutex<Option<String>>,
 }
 
@@ -105,7 +110,7 @@ impl TaskTools {
     pub fn new(
         root: PathBuf,
         file_limit: usize,
-        #[cfg(windows)] window: Option<super::desktop_tools::Target>,
+        #[cfg(any(windows, target_os = "linux"))] window: Option<super::window_tools::Target>,
     ) -> Self {
         Self {
             mcp: Mutex::new(Vec::new()),
@@ -116,35 +121,35 @@ impl TaskTools {
             requested_desktop_capture: AtomicBool::new(false),
             goal_progress_enabled: AtomicBool::new(false),
             goal_update: Mutex::new(None),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             window: Mutex::new(window),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             window_buttons: Mutex::new(std::collections::BTreeMap::new()),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             window_request: Mutex::new(None),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             desktop_request: DesktopRequest::default(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             desktop_delivery: Mutex::new(None),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             desktop_delivered: AtomicBool::new(false),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             desktop_file: Mutex::new(None),
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn configure_desktop(&mut self, request: DesktopRequest, delivered: bool) {
         self.desktop_request = request;
         self.desktop_delivered.store(delivered, Ordering::Release);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn desktop_delivered(&self) -> bool {
         self.desktop_delivered.load(Ordering::Acquire)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn desktop_file_written(&self) -> bool {
         self.desktop_file
             .lock()
@@ -152,12 +157,12 @@ impl TaskTools {
             .is_some()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn take_desktop_delivery(&self) -> Option<DesktopDelivery> {
         self.desktop_delivery.lock().ok()?.take()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn deliver_desktop(&self, image: Vec<u8>, cancelled: &AtomicBool) -> Result<()> {
         let (reply, result) = mpsc::sync_channel(1);
         *self.desktop_delivery.lock().expect("desktop delivery lock") =
@@ -293,12 +298,12 @@ impl TaskTools {
         )
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn window(&self) -> WindowChoice {
         self.window.lock().ok()?.clone()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn window_request(&self) -> Option<WindowRequest> {
         self.window_request
             .lock()
@@ -307,7 +312,7 @@ impl TaskTools {
             .map(|(request, _)| request.clone())
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn choose_window(&self, id: Uuid, target: WindowChoice) -> Result<()> {
         let mut pending = self.window_request.lock().expect("window request lock");
         ensure!(
@@ -325,16 +330,15 @@ impl TaskTools {
             .context("Pencere isteğinin süresi doldu")
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn request_window(&self, reason: String, cancelled: &AtomicBool) -> Result<Value> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        *self.window_request.lock().expect("window request lock") = Some((
-            WindowRequest {
-                id: Uuid::new_v4(),
-                reason,
-            },
-            sender,
-        ));
+        let id = Uuid::new_v4();
+        {
+            let mut pending = self.window_request.lock().expect("window request lock");
+            ensure!(pending.is_none(), "Başka bir pencere isteği bekliyor");
+            *pending = Some((WindowRequest { id, reason }, sender));
+        }
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut target = None;
         while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -347,10 +351,9 @@ impl TaskTools {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        self.window_request
-            .lock()
-            .expect("window request lock")
-            .take();
+        let mut pending = self.window_request.lock().expect("window request lock");
+        pending.take_if(|(request, _)| request.id == id);
+        drop(pending);
         ensure!(!cancelled.load(Ordering::Acquire), "Görev durduruldu");
         let Some(target) = target else {
             return Ok(tool_text(false, "Operatör yeni bir pencere seçmedi."));
@@ -439,13 +442,18 @@ impl TaskTools {
         cancelled: &AtomicBool,
     ) -> Result<Option<String>> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        *self.question.lock().expect("question lock") = Some((
-            Question {
-                id: Uuid::new_v4(),
-                text: text.into(),
-            },
-            sender,
-        ));
+        let id = Uuid::new_v4();
+        {
+            let mut pending = self.question.lock().expect("question lock");
+            ensure!(pending.is_none(), "Başka bir görev sorusu bekliyor");
+            *pending = Some((
+                Question {
+                    id,
+                    text: text.into(),
+                },
+                sender,
+            ));
+        }
         let mut result = None;
         while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
             match receiver.recv_timeout(Duration::from_millis(120)) {
@@ -457,7 +465,10 @@ impl TaskTools {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        self.question.lock().expect("question lock").take();
+        self.question
+            .lock()
+            .expect("question lock")
+            .take_if(|(question, _)| question.id == id);
         ensure!(!cancelled.load(Ordering::Acquire), "Görev durduruldu");
         Ok(result)
     }
@@ -483,14 +494,19 @@ impl TaskTools {
         file: bool,
         cancelled: &AtomicBool,
     ) -> Result<()> {
+        let id = Uuid::new_v4();
         let approval = Approval {
-            id: Uuid::new_v4(),
+            id,
             title,
             action,
             file,
         };
         let (send, receive) = mpsc::sync_channel(1);
-        *self.pending.lock().expect("approval lock") = Some((approval, send));
+        {
+            let mut pending = self.pending.lock().expect("approval lock");
+            ensure!(pending.is_none(), "Başka bir görev eylemi onay bekliyor");
+            *pending = Some((approval, send));
+        }
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut allowed = false;
         while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -503,7 +519,10 @@ impl TaskTools {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        self.pending.lock().expect("approval lock").take();
+        self.pending
+            .lock()
+            .expect("approval lock")
+            .take_if(|(approval, _)| approval.id == id);
         ensure!(
             allowed && !cancelled.load(Ordering::Acquire) && Instant::now() < deadline,
             "Görev eylemi onaylanmadı"
@@ -523,10 +542,16 @@ impl TaskTools {
         if params["tool"] == "chatoid_ask_user" {
             return self.ask(params, cancelled);
         }
+        #[cfg(target_os = "linux")]
+        if params["tool"] == "chatoid_desktop_text" {
+            return linux_desktop_text::call(self, params, cancelled);
+        }
         if params["tool"] != "chatoid_share_file" {
             #[cfg(windows)]
             return super::desktop_tools::call(self, params, result, cancelled);
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            return super::linux_desktop_tools::call(self, params, result, cancelled);
+            #[cfg(not(any(windows, target_os = "linux")))]
             anyhow::bail!("Bu görev aracı kullanılabilir değil");
         }
         ensure!(
@@ -570,9 +595,14 @@ pub fn definitions(tools: Option<&TaskTools>) -> Vec<Value> {
     }
     #[cfg(windows)]
     definitions.extend(super::desktop_tools::definitions());
-    #[cfg(windows)]
+    #[cfg(target_os = "linux")]
+    definitions.extend(super::linux_desktop_tools::definitions());
+    #[cfg(any(windows, target_os = "linux"))]
     if tools.is_some_and(|tools| tools.desktop_request.text_file) {
+        #[cfg(windows)]
         definitions.push(super::desktop_tools::desktop_text_definition());
+        #[cfg(target_os = "linux")]
+        definitions.push(linux_desktop_text::definition());
     }
     definitions
 }
@@ -587,15 +617,8 @@ fn snapshot(root: &Path, relative: &str, limit: usize) -> Result<ApprovedFile> {
             anyhow::bail!("Klasör dışından dosya paylaşılamaz");
         };
         let label = name.to_str().context("Geçersiz dosya adı")?;
-        let lower = label.to_ascii_lowercase();
         check_filename(label)?;
-        ensure!(
-            !lower.starts_with('.')
-                && ![".key", ".pem", ".pfx", ".p12", ".sqlite", ".sqlite3"]
-                    .iter()
-                    .any(|suffix| lower.ends_with(suffix)),
-            "Bu dosya paylaşılamaz"
-        );
+        ensure!(!super::private_file_name(label), "Bu dosya paylaşılamaz");
         if parts.peek().is_some() {
             directory = directory.open_dir_nofollow(name)?;
             continue;
@@ -655,8 +678,100 @@ mod tests {
     }
 
     #[test]
+    fn task_output_rejects_local_credentials_and_database_sidecars() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        for name in [
+            "owner.IDENTITY",
+            "auth.json",
+            "history.sqlite-wal",
+            "state.db-shm",
+            "host.db-journal",
+        ] {
+            std::fs::write(workspace.path().join(name), b"synthetic fixture")?;
+            assert!(snapshot(workspace.path(), name, 1024).is_err(), "{name}");
+        }
+        std::fs::write(workspace.path().join("author.json"), b"report")?;
+        assert_eq!(
+            snapshot(workspace.path(), "author.json", 1024)?.bytes,
+            b"report"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_action_or_question_cannot_be_replaced() -> Result<()> {
+        let tools = TaskTools::new(
+            PathBuf::new(),
+            0,
+            #[cfg(any(windows, target_os = "linux"))]
+            None,
+        );
+        let cancelled = AtomicBool::new(false);
+        let (send_approval, receive_approval) = mpsc::sync_channel(1);
+        let id = Uuid::new_v4();
+        *tools.pending.lock().expect("approval lock") = Some((
+            Approval {
+                id,
+                title: "first".into(),
+                action: "action".into(),
+                file: false,
+            },
+            send_approval,
+        ));
+        assert!(
+            tools
+                .approve("second".into(), "action".into(), false, &cancelled)
+                .is_err()
+        );
+        assert_eq!(tools.pending().map(|approval| approval.id), Some(id));
+        tools.decide(id, true)?;
+        assert!(receive_approval.recv()?);
+
+        let (send_answer, receive_answer) = mpsc::sync_channel(1);
+        let id = Uuid::new_v4();
+        *tools.question.lock().expect("question lock") = Some((
+            Question {
+                id,
+                text: "first".into(),
+            },
+            send_answer,
+        ));
+        assert!(
+            tools
+                .wait_for_answer("second", Instant::now(), &cancelled)
+                .is_err()
+        );
+        assert_eq!(tools.question().map(|question| question.id), Some(id));
+        tools.answer(id, "answer".into())?;
+        assert_eq!(receive_answer.recv()?, "answer");
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let (send_choice, receive_choice) = mpsc::sync_channel(1);
+            let id = Uuid::new_v4();
+            *tools.window_request.lock().expect("window request lock") = Some((
+                WindowRequest {
+                    id,
+                    reason: "first".into(),
+                },
+                send_choice,
+            ));
+            assert!(tools.request_window("second".into(), &cancelled).is_err());
+            assert_eq!(tools.window_request().map(|request| request.id), Some(id));
+            tools.choose_window(id, None)?;
+            assert!(receive_choice.recv()?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn requested_desktop_capture_is_one_shot_and_share_only() -> Result<()> {
-        let tools = TaskTools::new(PathBuf::new(), 0, None);
+        let tools = TaskTools::new(
+            PathBuf::new(),
+            0,
+            #[cfg(any(windows, target_os = "linux"))]
+            None,
+        );
         let cancelled = Arc::new(AtomicBool::new(false));
         tools.allow_requested_desktop_capture();
         let worker_tools = Arc::new(tools);
@@ -712,7 +827,12 @@ mod tests {
 
     #[test]
     fn goal_progress_tool_requires_enablement_and_valid_values() -> Result<()> {
-        let tools = TaskTools::new(PathBuf::new(), 0, None);
+        let tools = TaskTools::new(
+            PathBuf::new(),
+            0,
+            #[cfg(any(windows, target_os = "linux"))]
+            None,
+        );
         let mut result = TaskResult::default();
         let cancelled = AtomicBool::new(false);
         let call = |status: &str, progress: &str| json!({"tool":"chatoid_goal_progress","arguments":{"status":status,"progress":progress}});

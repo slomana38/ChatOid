@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -92,6 +92,9 @@ const SHARED_AVATAR: &str = "(
     WHERE peer.actor=avatars.actor AND own.actor=?1 AND peer.through_seq IS NULL AND own.through_seq IS NULL
   )
 )";
+
+const MAX_PENDING_CHUNKS_PER_ACTOR: usize = 2 * MAX_BINARY_ATTACHMENT.div_ceil(FILE_CHUNK);
+const MAX_PENDING_CHUNKS_PER_HOST: usize = 8 * MAX_BINARY_ATTACHMENT.div_ceil(FILE_CHUNK);
 
 #[derive(Default)]
 struct Auth {
@@ -1186,13 +1189,13 @@ fn attachment_info(db: &Connection, seq: i64) -> Result<Option<AttachmentInfo>> 
         .query_row(
             "SELECT a.name,a.bytes,p.preview,EXISTS(SELECT 1 FROM binary_files b WHERE b.seq=a.seq) FROM attachments a LEFT JOIN attachment_previews p ON p.seq=a.seq WHERE a.seq=?1",
             [seq],
-            |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?, row.get(3)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Option<String>>(2)?, row.get(3)?)),
         )
         .optional()?;
     row.map(|(name, bytes, preview, binary)| {
         Ok(AttachmentInfo {
             name,
-            bytes,
+            bytes: bytes as usize,
             preview: preview.as_deref().map(serde_json::from_str).transpose()?,
             binary,
         })
@@ -1354,11 +1357,11 @@ fn send(
         if is_withdrawn(db, seq)? {
             return message(db, author, seq);
         }
-        if let Some(expected) = binary {
+        if let Some((name, bytes, hash)) = binary {
             let saved = db.query_row("SELECT a.name,a.bytes,b.hash FROM attachments a JOIN binary_files b USING(seq) WHERE seq=?1",
-                [seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?, r.get::<_, String>(2)?))).optional()?;
+                [seq], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?))).optional()?;
             ensure!(
-                original == payload && saved == Some(expected),
+                original == payload && saved == Some((name, bytes as u32, hash)),
                 "Mesaj kimliği başka içerikle kullanılmış"
             );
             return message(db, author, seq);
@@ -1459,7 +1462,7 @@ fn send(
     if let Some(file) = attachment {
         db.execute(
             "INSERT INTO attachments VALUES(?1,?2,?3,?4)",
-            params![seq, file.name, file.data, file.info().bytes],
+            params![seq, file.name, file.data, file.info().bytes as u32],
         )?;
         if let Some(preview) = file_bytes
             .as_deref()
@@ -1476,7 +1479,7 @@ fn send(
             "SELECT offset,data FROM upload_chunks WHERE actor=?1 AND id=?2 ORDER BY offset",
         )?;
         let chunks = statement.query_map(params![author, draft.id.to_string()], |row| {
-            Ok((row.get::<_, usize>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((row.get::<_, u32>(0)? as usize, row.get::<_, Vec<u8>>(1)?))
         })?;
         let mut content = Vec::with_capacity(bytes);
         for chunk in chunks {
@@ -1493,7 +1496,7 @@ fn send(
         );
         db.execute(
             "INSERT INTO attachments VALUES(?1,?2,'',?3)",
-            params![seq, name, bytes],
+            params![seq, name, bytes as u32],
         )?;
         db.execute(
             "INSERT INTO binary_files VALUES(?1,?2,?3)",
@@ -1603,63 +1606,89 @@ async fn upload(
         .auth(&headers)
         .ok_or_else(|| Failure(StatusCode::UNAUTHORIZED, "Oturum geçersiz".into()))?;
     blocking(move || {
-        ensure!(
-            offset.is_multiple_of(FILE_CHUNK)
-                && (1..=FILE_CHUNK).contains(&chunk.len())
-                && offset <= MAX_BINARY_ATTACHMENT - chunk.len(),
-            "Geçersiz dosya parçası"
-        );
-        let db = host.db.lock().expect("database lock");
-        if actor.data.role == Role::Agent {
-            let direct: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM members m JOIN rooms r ON r.id=m.room WHERE m.actor=?1 AND m.through_seq IS NULL AND r.is_group=0 AND r.closed=0)",
-                [&actor.data.key], |row| row.get(0),
-            )?;
-            ensure!(direct, "Ajan dosyası için açık bire bir sohbet gerekli");
-        }
-        let id = id.to_string();
-        let published: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE actor=?1 AND client_id=?2)",
-            params![actor.data.key, id],
-            |row| row.get(0),
-        )?;
-        if published {
-            return Ok(());
-        }
-        db.execute("DELETE FROM upload_chunks WHERE updated<?1", [now() - 3600])?;
-        let previous: Option<Vec<u8>> = db
-            .query_row(
-                "SELECT data FROM upload_chunks WHERE actor=?1 AND id=?2 AND offset=?3",
-                params![actor.data.key, id, offset],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(previous) = previous {
-            ensure!(previous == chunk.as_ref(), "Yükleme parçası değişti");
-            return Ok(());
-        }
-        let total: usize = db.query_row(
-            "SELECT COALESCE(SUM(length(data)),0) FROM upload_chunks",
-            [],
-            |row| row.get(0),
-        )?;
-        let owned: usize = db.query_row(
-            "SELECT COALESCE(SUM(length(data)),0) FROM upload_chunks WHERE actor=?1",
-            [&actor.data.key],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            total + chunk.len() <= 8 * MAX_BINARY_ATTACHMENT
-                && owned + chunk.len() <= 2 * MAX_BINARY_ATTACHMENT,
-            "Host dosya kuyruğu dolu"
-        );
-        db.execute(
-            "INSERT INTO upload_chunks VALUES(?1,?2,?3,?4,?5)",
-            params![actor.data.key, id, offset, chunk.as_ref(), now()],
-        )?;
-        Ok(())
+        stage_upload(
+            &mut host.db.lock().expect("database lock"),
+            &actor,
+            id,
+            offset,
+            &chunk,
+        )
     })
     .await
+}
+
+fn stage_upload(
+    connection: &mut Connection,
+    actor: &Card,
+    id: Uuid,
+    offset: usize,
+    chunk: &[u8],
+) -> Result<()> {
+    ensure!(
+        offset.is_multiple_of(FILE_CHUNK)
+            && (1..=FILE_CHUNK).contains(&chunk.len())
+            && offset <= MAX_BINARY_ATTACHMENT - chunk.len(),
+        "Geçersiz dosya parçası"
+    );
+    let offset = offset as u32;
+    let db = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor_id = &actor.data.key;
+    let id = id.to_string();
+    let published: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE actor=?1 AND client_id=?2)",
+        params![actor_id, id],
+        |row| row.get(0),
+    )?;
+    if published {
+        return Ok(());
+    }
+    let eligible: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members m JOIN rooms r ON r.id=m.room
+         WHERE m.actor=?1 AND m.through_seq IS NULL AND r.closed=0 AND (?2 OR r.is_group=0))",
+        params![actor_id, actor.data.role == Role::Human],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        eligible,
+        "Dosya yüklemek için açık bir sohbete üye olmalısın"
+    );
+
+    let timestamp = now();
+    db.execute(
+        "DELETE FROM upload_chunks WHERE updated<?1",
+        [timestamp - 3600],
+    )?;
+    let previous: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT data FROM upload_chunks WHERE actor=?1 AND id=?2 AND offset=?3",
+            params![actor_id, id, offset],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(previous) = previous {
+        ensure!(previous == chunk, "Yükleme parçası değişti");
+        db.commit()?;
+        return Ok(());
+    }
+    let (total_bytes, owned_bytes, total_chunks, owned_chunks): (u32, u32, u32, u32) = db.query_row(
+        "SELECT COALESCE(SUM(length(data)),0), COALESCE(SUM(length(data)) FILTER(WHERE actor=?1),0),
+                COUNT(*), COUNT(*) FILTER(WHERE actor=?1) FROM upload_chunks",
+        [actor_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    ensure!(
+        total_bytes as usize <= 8 * MAX_BINARY_ATTACHMENT - chunk.len()
+            && owned_bytes as usize <= 2 * MAX_BINARY_ATTACHMENT - chunk.len()
+            && (total_chunks as usize) < MAX_PENDING_CHUNKS_PER_HOST
+            && (owned_chunks as usize) < MAX_PENDING_CHUNKS_PER_ACTOR,
+        "Host dosya kuyruğu dolu"
+    );
+    db.execute(
+        "INSERT INTO upload_chunks VALUES(?1,?2,?3,?4,?5)",
+        params![actor_id, id, offset, chunk, timestamp],
+    )?;
+    db.commit()?;
+    Ok(())
 }
 
 async fn download_binary(
@@ -1679,7 +1708,7 @@ async fn download_binary(
         let bytes: Vec<u8> = db
             .query_row(
                 "SELECT substr(data,?2,?3) FROM binary_files WHERE seq=?1",
-                params![seq, offset + 1, FILE_CHUNK],
+                params![seq, (offset + 1) as u32, FILE_CHUNK as u32],
                 |row| row.get(0),
             )
             .context("Dosya bulunamadı")?;
@@ -1698,4 +1727,65 @@ async fn action(
         .auth(&headers)
         .ok_or_else(|| Failure(StatusCode::UNAUTHORIZED, "Oturum geçersiz".into()))?;
     blocking(move || host.apply(&actor, action)).await
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    #[test]
+    fn stages_chunks_for_active_members_and_applies_pending_record_limits() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(SCHEMA)?;
+        let actor = Identity::generate(Role::Human, "gul", "Gül")?;
+        let room = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        remember(&db, &actor.card)?;
+        assert!(stage_upload(&mut db, &actor.card, first, 0, b"a").is_err());
+
+        db.execute(
+            "INSERT INTO rooms(id,name,owner,is_group) VALUES(?1,?2,?3,1)",
+            params![room.to_string(), "Group", actor.id()],
+        )?;
+        db.execute(
+            "INSERT INTO members(room,actor,after_seq) VALUES(?1,?2,0)",
+            params![room.to_string(), actor.id()],
+        )?;
+        stage_upload(&mut db, &actor.card, first, 0, b"a")?;
+        for _ in 1..MAX_PENDING_CHUNKS_PER_ACTOR {
+            stage_upload(&mut db, &actor.card, Uuid::new_v4(), 0, b"b")?;
+        }
+        stage_upload(&mut db, &actor.card, first, 0, b"a")?;
+        assert!(stage_upload(&mut db, &actor.card, first, 0, b"c").is_err());
+        assert!(stage_upload(&mut db, &actor.card, Uuid::new_v4(), 0, b"c").is_err());
+
+        let peer = Identity::generate(Role::Human, "deniz", "Deniz")?;
+        remember(&db, &peer.card)?;
+        for _ in MAX_PENDING_CHUNKS_PER_ACTOR..MAX_PENDING_CHUNKS_PER_HOST {
+            db.execute(
+                "INSERT INTO upload_chunks VALUES(?1,?2,0,?3,?4)",
+                params![peer.id(), Uuid::new_v4().to_string(), b"d", now()],
+            )?;
+        }
+        db.execute(
+            "DELETE FROM upload_chunks WHERE actor=?1 AND id=?2",
+            params![actor.id(), first.to_string()],
+        )?;
+        let peer_last = Uuid::new_v4();
+        db.execute(
+            "INSERT INTO upload_chunks VALUES(?1,?2,0,?3,?4)",
+            params![peer.id(), peer_last.to_string(), b"d", now()],
+        )?;
+        assert!(stage_upload(&mut db, &actor.card, first, 0, b"a").is_err());
+        db.execute(
+            "DELETE FROM upload_chunks WHERE actor=?1 AND id=?2",
+            params![peer.id(), peer_last.to_string()],
+        )?;
+        stage_upload(&mut db, &actor.card, first, 0, b"a")?;
+        db.execute("DELETE FROM upload_chunks WHERE actor=?1", [actor.id()])?;
+        db.execute("UPDATE rooms SET closed=1 WHERE id=?1", [room.to_string()])?;
+        assert!(stage_upload(&mut db, &actor.card, first, 0, b"a").is_err());
+        Ok(())
+    }
 }

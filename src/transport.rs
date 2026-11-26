@@ -1,6 +1,6 @@
 use std::{
     fmt, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpListener},
     path::Path,
     sync::{Arc, Once},
@@ -27,6 +27,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::{
     host::{Host, digest},
     identity::{Identity, encode, write_new},
+    local_file::{open_regular, read_bounded},
     protocol::*,
 };
 
@@ -56,16 +57,38 @@ struct Material {
 
 impl Material {
     fn open(path: &Path) -> Result<Self> {
-        if path.exists() {
-            return Ok(serde_json::from_slice(&fs::read(path)?)?);
+        const MAX_MATERIAL_BYTES: usize = 24_000;
+
+        match open_regular(path, true) {
+            Ok(file) => {
+                return Ok(serde_json::from_slice(&read_bounded(
+                    &file,
+                    MAX_MATERIAL_BYTES,
+                )?)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let generated = rcgen::generate_simple_self_signed(vec!["chatoid.local".to_owned()])?;
         let material = Self {
             cert: generated.cert.der().to_vec(),
             key: generated.signing_key.serialize_der(),
         };
-        write_new(path, &serde_json::to_vec(&material)?)?;
-        Ok(material)
+        match write_new(path, &serde_json::to_vec(&material)?) {
+            Ok(()) => Ok(material),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
+            {
+                let file = open_regular(path, true)?;
+                Ok(serde_json::from_slice(&read_bounded(
+                    &file,
+                    MAX_MATERIAL_BYTES,
+                )?)?)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

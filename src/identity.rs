@@ -11,6 +11,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
+use crate::local_file::{open_regular, read_bounded};
+
+const MAX_IDENTITY_FILE_BYTES: usize = 8192;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -257,8 +261,7 @@ impl Identity {
     }
 
     pub(crate) fn from_session(path: &Path, seed: &[u8; 32]) -> Result<Self> {
-        ensure!(fs::metadata(path)?.len() <= 8192, "Geçersiz kimlik dosyası");
-        let bytes = Zeroizing::new(fs::read(path)?);
+        let bytes = read_bounded(&open_regular(path, true)?, MAX_IDENTITY_FILE_BYTES)?;
         #[derive(Deserialize)]
         struct StoredCard {
             card: Card,
@@ -333,8 +336,7 @@ impl Identity {
     }
 
     pub fn load(path: &Path, role: Role, password: Option<&str>) -> Result<Self> {
-        ensure!(fs::metadata(path)?.len() <= 8192, "Geçersiz kimlik dosyası");
-        let bytes = Zeroizing::new(fs::read(path)?);
+        let bytes = read_bounded(&open_regular(path, true)?, MAX_IDENTITY_FILE_BYTES)?;
         let record: KeyFile = serde_json::from_slice(&bytes)?;
         record.card.check()?;
         ensure!(

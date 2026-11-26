@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -28,6 +28,13 @@ pub mod app_server;
 #[cfg(windows)]
 #[path = "agent/desktop_tools.rs"]
 pub mod desktop_tools;
+#[cfg(target_os = "linux")]
+#[path = "agent/linux_desktop_tools.rs"]
+pub mod linux_desktop_tools;
+#[cfg(windows)]
+pub use desktop_tools as window_tools;
+#[cfg(target_os = "linux")]
+pub use linux_desktop_tools as window_tools;
 pub mod task_tools;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -468,6 +475,26 @@ fn task_codex_home(command: &mut Command, home: &Path) -> Result<()> {
     Ok(())
 }
 
+fn private_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with('.')
+        || lower == "auth.json"
+        || [
+            ".identity",
+            ".key",
+            ".pem",
+            ".pfx",
+            ".p12",
+            ".sqlite",
+            ".sqlite3",
+            "-wal",
+            "-shm",
+            "-journal",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
 fn inspect(root: &Dir, name: &str) -> Result<String> {
     let path = Path::new(name);
     ensure!(
@@ -485,13 +512,8 @@ fn inspect(root: &Dir, name: &str) -> Result<String> {
             break;
         };
         let label = piece.to_str().context("Geçersiz dosya adı")?;
-        let lower = label.to_ascii_lowercase();
         ensure!(
-            !lower.starts_with('.')
-                && !lower.ends_with(['.', ' '])
-                && ![".key", ".pem", ".pfx", ".p12", ".sqlite", ".sqlite3"]
-                    .iter()
-                    .any(|ext| lower.ends_with(ext)),
+            !private_file_name(label) && !label.ends_with(['.', ' ']),
             "Bu dosya paylaşılmaz"
         );
         if i < parts.len() - 1 {
@@ -511,9 +533,10 @@ fn inspect(root: &Dir, name: &str) -> Result<String> {
                 options.custom_flags(libc::O_NONBLOCK);
             }
             let file = dir.open_with(piece, &options)?;
+            let metadata = file.metadata()?;
             ensure!(
-                file.metadata()?.is_file(),
-                "Yalnızca normal dosyalar okunabilir"
+                metadata.is_file() && metadata.nlink() == 1,
+                "Yalnızca bağlantısız normal dosyalar okunabilir"
             );
             let mut bytes = Vec::new();
             file.take(8192).read_to_end(&mut bytes)?;
@@ -526,7 +549,7 @@ fn inspect(root: &Dir, name: &str) -> Result<String> {
     for entry in dir.entries()?.take(80) {
         let entry = entry?;
         let label = entry.file_name().to_string_lossy().into_owned();
-        if !label.starts_with('.') && !entry.file_type()?.is_symlink() {
+        if !private_file_name(&label) && !entry.file_type()?.is_symlink() {
             names.push(label);
         }
     }
@@ -541,12 +564,14 @@ fn codex_command(codex: &str) -> Result<Command> {
     if program.components().count() > 1 {
         program = program.canonicalize().context("Codex yolu bulunamadı")?;
     }
-    let mut command = Command::new(program);
+    let command = Command::new(program);
     #[cfg(windows)]
-    {
+    let command = {
+        let mut command = command;
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
-    }
+        command
+    };
     Ok(command)
 }
 

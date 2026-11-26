@@ -456,17 +456,23 @@ impl App {
     }
 
     fn sign_out(&mut self) -> Result<()> {
-        if let Some(identity) = &self.identity
+        let cleanup_error = if let Some(identity) = &self.identity
             && self.role == Role::Human
         {
-            remember::forget_account(&self.profile_root(), &identity.card.data.handle)?;
-        }
-        let login = Self::new(self.role, self.data.clone());
-        #[cfg(windows)]
-        let login = Self {
-            taskbar_icon: self.taskbar_icon.take(),
-            ..login
+            remember::forget_account(&self.profile_root(), &identity.card.data.handle)?
+        } else {
+            None
         };
+        let mut login = Self::new(self.role, self.data.clone());
+        #[cfg(windows)]
+        {
+            login.taskbar_icon = self.taskbar_icon.take();
+        }
+        if let Some(error) = cleanup_error {
+            login.notice = format!(
+                "Oturum kapatıldı. Anahtar kasası temizliği daha sonra yeniden denenecek. {error:#}"
+            );
+        }
         *self = login;
         Ok(())
     }
@@ -714,7 +720,11 @@ impl App {
                     visual::small_icon(ui, Outline::Lock);
                     ui.checkbox(&mut self.remember_me, "Beni hatırla")
                         .on_hover_text(
-                            "Bu cihazdaki sonraki açılışta hesabına otomatik giriş yap.",
+                            if cfg!(target_os = "linux") {
+                                "Oturum anahtarı Linux anahtar kasasında (Secret Service) saklanır. Anahtar kasası kullanılamıyorsa oturum kaydedilmez."
+                            } else {
+                                "Bu cihazdaki sonraki açılışta hesabına otomatik giriş yap."
+                            },
                         );
                 });
             } else if self.signing_up {
@@ -868,7 +878,7 @@ impl App {
                     });
                 }
             });
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             if ui.button("Fotoğraf seç").clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("JPEG / PNG", &["jpg", "jpeg", "png"])
@@ -966,7 +976,7 @@ impl App {
                                 self.page = Page::Profile;
                                 ui.close();
                             }
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             if ui.button("Profil fotoğrafı seç").clicked() {
                                 ui.close();
                                 if let Some(path) = rfd::FileDialog::new()
@@ -1241,7 +1251,7 @@ impl App {
             .as_ref()
             .filter(|_| self.wallpaper_for_room)
             .map(Self::draft_key);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let root = self.preferences_root();
         let previous = self.preferences.wallpaper.clone();
         let mut wallpaper = key
@@ -1256,7 +1266,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut wallpaper.background, Background::Orbit, "Yörünge");
                 ui.selectable_value(&mut wallpaper.background, Background::Plain, "Düz renk");
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 if ui.button("Fotoğraf seç").clicked()
                     && let Some(root) = &root
                     && let Some(path) = rfd::FileDialog::new()
@@ -1427,7 +1437,7 @@ impl App {
                 self.edit_profile_name(ui, &name);
             }
             ProfilePane::Photo => {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 if visual::profile_action(ui, Outline::Plus, "Fotoğraf seç", "JPEG veya PNG", false)
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
@@ -2317,9 +2327,36 @@ impl App {
                             Err(error) => self.notice = format!("Pano resmi eklenemedi. {error:#}"),
                         }
                     }
-                    if let Some(path) = ui.input(|input| input.raw.dropped_files.iter().find_map(|file| file.path.clone())) {
-                        self.stage_attachment(&path, limit as u64);
+                }
+                #[cfg(target_os = "linux")]
+                if limit > 0 {
+                    let focused = ui.memory(|memory| memory.has_focus(draft_id));
+                    let paste = focused
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::V)
+                                && input.modifiers.command
+                                && !input.events.iter().any(|event| {
+                                    matches!(event, egui::Event::Paste(text) if !text.is_empty())
+                                })
+                        });
+                    if paste && let Some(root) = self.preferences_root() {
+                        match preferences::clipboard_image(&root, limit as u64) {
+                            Ok(Some(path)) => self.attachment = Some(path),
+                            Ok(None) => {}
+                            Err(error) => self.notice = format!("Pano resmi eklenemedi. {error:#}"),
+                        }
                     }
+                }
+                if limit > 0
+                    && let Some(path) = ui.input(|input| {
+                        input
+                            .raw
+                            .dropped_files
+                            .iter()
+                            .find_map(|file| file.path.clone())
+                    })
+                {
+                    self.stage_attachment(&path, limit as u64);
                 }
                 if room.group
                     && let Some((offset, query)) = mention_query(&self.draft)
@@ -2433,7 +2470,7 @@ impl App {
                     .horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.;
                         visual::composer_popup(ui, Outline::Attachment, "Dosya ekle", |ui| {
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             if ui
                                 .add_enabled(limit > 0, egui::Button::new("Cihazdan dosya seç"))
                                 .clicked()
@@ -2446,9 +2483,9 @@ impl App {
                             if limit == 0 {
                                 ui.weak("Bu host dosya eklerini desteklemiyor.");
                             } else {
-                                #[cfg(windows)]
+                                #[cfg(any(windows, target_os = "linux"))]
                                 ui.weak(format!("Host sınırı · {} MiB", limit / 1048576));
-                                #[cfg(not(windows))]
+                                #[cfg(not(any(windows, target_os = "linux")))]
                                 ui.weak("Dosya seçici bu sürümde Windows’ta kullanılabilir.");
                             }
                         });
@@ -2734,7 +2771,7 @@ impl App {
                         if is_image {
                             open = true;
                         } else {
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             if let Some(path) =
                                 rfd::FileDialog::new().set_file_name(&file.name).save_file()
                             {
@@ -2906,7 +2943,7 @@ impl App {
                     ));
                     ui.close();
                 }
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 if let Some(file) = &message.attachment
                     && ui.button("Eki kaydet").clicked()
                     && let Some(path) = rfd::FileDialog::new().set_file_name(&file.name).save_file()
@@ -3698,7 +3735,7 @@ impl App {
                     },
                     true,
                 );
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 if ui.button("Çalışma klasörü seç").clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
@@ -3731,7 +3768,7 @@ impl App {
                 .filter(|job| matches!(job.status, crate::session::WorkspaceJobStatus::Pending))
                 .count();
             let label = if let Some(approval) = &local.task_approval {
-                if approval.file {
+                if approval.file || approval.title == "Masaüstü metin dosyası" {
                     "Dosya onayı bekliyor"
                 } else {
                     "Pencere onayı bekliyor"
@@ -3836,7 +3873,7 @@ impl App {
             &mut self.settings.workspace,
             "Klasörün tam yolu",
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if visual::work_tab(ui, Outline::Archive, "Çalışma klasörü seç", false).clicked()
             && let Some(path) = rfd::FileDialog::new().pick_folder()
         {
@@ -3907,6 +3944,7 @@ impl App {
                 self.settings.skill_roots.remove(index);
                 self.settings_dirty = true;
             }
+            #[cfg(any(windows, target_os = "linux"))]
             if ui.add_enabled(self.settings.skill_roots.len() < 8, egui::Button::new("Skill klasörü ekle")).clicked()
                 && let Some(path) = rfd::FileDialog::new().set_title("Skill klasörünü veya skill'leri içeren klasörü seç").pick_folder()
                 && !self.settings.skill_roots.contains(&path)
@@ -4065,8 +4103,16 @@ impl App {
         if let Some(approval) = &local.task_approval {
             let (icon, title, action) = if approval.file {
                 (Outline::Attachment, "Dosya paylaşımı", "Dosyayı onayla")
+            } else if approval.title == "Masaüstü metin dosyası" {
+                (Outline::Attachment, "Masaüstü dosyası", "Dosyayı onayla")
             } else if approval.action.starts_with("MCP araç çağrısı") {
                 (Outline::Agent, "MCP araç çağrısı", "Çağrıyı onayla")
+            } else if approval
+                .action
+                .to_lowercase()
+                .contains("masaüstü görüntüsünü")
+            {
+                (Outline::Agent, "Ekran görüntüsü", "Görüntüyü onayla")
             } else {
                 (Outline::Agent, "Pencere eylemi", "Eylemi onayla")
             };
@@ -4083,8 +4129,16 @@ impl App {
                 });
             });
         } else {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             self.desktop_task_controls(ui, local);
+            #[cfg(target_os = "linux")]
+            if local
+                .jobs
+                .iter()
+                .any(|job| job.status == WorkspaceJobStatus::Running)
+            {
+                ui.weak("Linux ekran görüntüleri masaüstü izin penceresi üzerinden alınır.");
+            }
         }
         for job in local.jobs.iter().rev().take(12) {
             ui.push_id((job.id, job.approval_round), |ui| {
@@ -4433,6 +4487,7 @@ impl App {
                 ui.weak("OAuth destekleyen bağlantılarda araç listesinden tarayıcıda giriş yapabilirsin.");
             } else {
                 field(ui, "Program", &mut self.mcp_form.command, "Programın tam yolu veya komut adı");
+                #[cfg(any(windows, target_os = "linux"))]
                 if ui.small_button("Program seç").clicked()
                     && let Some(path) = rfd::FileDialog::new().set_title("MCP programını seç").pick_file()
                 { self.mcp_form.command = path.to_string_lossy().into_owned(); }
@@ -4522,8 +4577,12 @@ impl App {
         selected
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn desktop_task_controls(&mut self, ui: &mut Ui, local: &crate::session::Local) {
+        #[cfg(target_os = "linux")]
+        if !crate::agent::window_tools::is_native_x11_session() {
+            return;
+        }
         ui.add_space(8.);
         visual::profile_section(ui, Outline::Agent, "Pencere araçları", |ui| {
             let running = local
@@ -4559,7 +4618,7 @@ impl App {
                     {
                         self.command(Command::SetDesktopTarget(None));
                     }
-                    let windows = crate::agent::desktop_tools::windows();
+                    let windows = crate::agent::window_tools::windows();
                     if windows.is_empty() {
                         ui.weak("Uygun, açık pencere bulunamadı.");
                     }

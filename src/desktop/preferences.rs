@@ -105,7 +105,7 @@ pub fn stage_file(root: &Path, source: &Path, limit: u64) -> Result<PathBuf> {
     Ok(target)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn wallpaper_image(root: &Path, source: &Path) -> Result<PathBuf> {
     let file = fs::File::open(source)?;
     ensure!(
@@ -130,7 +130,7 @@ pub fn wallpaper_image(root: &Path, source: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn clipboard_image(root: &Path, limit: u64) -> Result<Option<PathBuf>> {
     let mut clipboard = arboard::Clipboard::new()?;
     let image = match clipboard.get_image() {

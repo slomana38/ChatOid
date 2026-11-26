@@ -18,10 +18,13 @@ use uuid::Uuid;
 use crate::{
     agent::{self, Settings},
     identity::{Card, Identity, Role, Signed, encode, pack, unpack, write_new},
+    local_file::{open_regular, read_bounded},
     protocol::*,
     transport::{self, Connection, RemoteError, RunningHost},
 };
 
+#[cfg(any(windows, target_os = "linux"))]
+const DESKTOP_SCREENSHOT_NAME: &str = "Ekran görüntüsü.jpg";
 const TASK_QUESTION: &str = "Codex görev sorusu\n";
 
 pub mod automation;
@@ -165,13 +168,13 @@ pub struct Local {
     pub task_skills: Option<Vec<agent::app_server::TaskSkill>>,
     #[serde(skip)]
     pub task_mcp: Option<Vec<agent::app_server::McpConnection>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[serde(skip)]
-    pub desktop_target: Option<agent::desktop_tools::Target>,
-    #[cfg(windows)]
+    pub desktop_target: Option<agent::window_tools::Target>,
+    #[cfg(any(windows, target_os = "linux"))]
     #[serde(skip)]
-    pub desktop_active: Option<agent::desktop_tools::Target>,
-    #[cfg(windows)]
+    pub desktop_active: Option<agent::window_tools::Target>,
+    #[cfg(any(windows, target_os = "linux"))]
     #[serde(skip)]
     pub desktop_request: Option<agent::task_tools::WindowRequest>,
     #[serde(skip)]
@@ -344,10 +347,10 @@ pub enum Command {
     DecideWorkspaceJob(Uuid, WorkspaceDecision),
     CancelWorkspaceJob(Uuid),
     RetryWorkspaceJob(Uuid),
-    #[cfg(windows)]
-    SetDesktopTarget(Option<agent::desktop_tools::Target>),
-    #[cfg(windows)]
-    DecideDesktopTarget(Uuid, Option<agent::desktop_tools::Target>),
+    #[cfg(any(windows, target_os = "linux"))]
+    SetDesktopTarget(Option<agent::window_tools::Target>),
+    #[cfg(any(windows, target_os = "linux"))]
+    DecideDesktopTarget(Uuid, Option<agent::window_tools::Target>),
     DecideTaskAction(Uuid, bool),
     Start(SocketAddr),
     Stop,
@@ -550,7 +553,14 @@ pub struct Session {
 impl Session {
     pub fn new(path: PathBuf, identity: Identity, inbox: Option<PathBuf>) -> Result<Self> {
         let dir = path.join(identity.id());
-        fs::create_dir_all(&dir)?;
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&dir)?;
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -705,7 +715,7 @@ impl Worker {
             if self.receive_upload() | self.receive_model() {
                 edited = true;
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             if self.deliver_task_desktop() {
                 edited = true;
             }
@@ -745,7 +755,7 @@ impl Worker {
                 self.local.task_approval = approval;
                 edited = true;
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let active = self.task_tools.as_ref().and_then(|tools| tools.window());
                 let request = self
@@ -1257,19 +1267,18 @@ impl Worker {
         let entries = fs::read_dir(root.join(self.identity.id()))?;
         for entry in entries.flatten().take(32) {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("invite")
-                || !entry.file_type()?.is_file()
-            {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("invite") {
                 continue;
             }
-            let mut contents = String::new();
-            if fs::File::open(&path)
-                .and_then(|file| file.take(32_769).read_to_string(&mut contents))
-                .is_err()
-            {
+            let Ok(contents) =
+                open_regular(&path, false).and_then(|file| read_bounded(&file, 32_768))
+            else {
                 continue;
-            }
-            let Ok(ticket) = unpack::<Ticket>("invite", &contents) else {
+            };
+            let Ok(contents) = std::str::from_utf8(&contents) else {
+                continue;
+            };
+            let Ok(ticket) = unpack::<Ticket>("invite", contents) else {
                 continue;
             };
             if ticket.grant.is_some()
@@ -1540,7 +1549,7 @@ impl Worker {
         queued
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn deliver_task_desktop(&mut self) -> bool {
         let Some(delivery) = self
             .task_tools
@@ -1577,16 +1586,14 @@ impl Worker {
                         reply: None,
                         invitation: None,
                         attachment: Some(Attachment {
-                            name: "Ekran görüntüsü.jpg".into(),
+                            name: DESKTOP_SCREENSHOT_NAME.into(),
                             data: encode(delivery.image),
                         }),
                     },
                 },
             )?;
             ensure!(
-                message.client_id == desktop_delivery_id(&job)
-                    && !message.withdrawn
-                    && message.attachment.is_some(),
+                desktop_delivery_acknowledged(self.identity.id(), &job, &message),
                 "Host görüntü ekini doğrulamadı"
             );
             self.local
@@ -2166,7 +2173,7 @@ impl Worker {
                     .context("Bu görev çalışmıyor")?;
                 cancel.store(true, std::sync::atomic::Ordering::Release);
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             Command::SetDesktopTarget(target) => {
                 ensure!(
                     self.identity.card.data.role == Role::Agent && self.workspace_cancel.is_none(),
@@ -2174,7 +2181,7 @@ impl Worker {
                 );
                 self.local.desktop_target = target;
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             Command::DecideDesktopTarget(id, target) => {
                 let gate = self
                     .task_tools
@@ -3398,7 +3405,7 @@ impl Worker {
                         *id == job.id && cancel.load(std::sync::atomic::Ordering::Acquire)
                     });
                     let waiting_approval = self.local.task_approval.is_some();
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     let waiting_approval = waiting_approval || self.local.desktop_request.is_some();
                     if stopping {
                         TaskPhase::Stopping
@@ -3536,7 +3543,7 @@ impl Worker {
             {
                 "Görev sohbetteki sorunun yanıtını bekliyor."
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             (_, WorkspaceJobStatus::Running)
                 if self
                     .task_tools
@@ -4054,32 +4061,29 @@ impl Worker {
         let tools = agent::task_tools::TaskTools::new(
             path.clone(),
             limit,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             self.local.desktop_target.take(),
         );
         let request_text = operator_request_text(link, &job);
         let requires_desktop_image =
-            !plan_only && review.is_none() && requested_desktop_capture(&request_text);
-        #[cfg(windows)]
+            !plan_only && review.is_none() && requested_desktop_capture(request_text);
+        #[cfg(any(windows, target_os = "linux"))]
         let (tools, desktop_text, image_before_text, already_delivered) = {
             let mut tools = tools;
-            let request = desktop_request(&source.text);
+            let request = desktop_request(request_text);
             let enabled = !plan_only && review.is_none();
             let desktop_text = enabled && request.text_file;
             let image_before_text = enabled && request.image_before_text;
             let already_delivered = image_before_text
                 && link.messages.values().any(|message| {
-                    message.client_id == desktop_delivery_id(&job)
-                        && message.room == job.selection.room
-                        && !message.withdrawn
-                        && message.attachment.is_some()
+                    desktop_delivery_acknowledged(self.identity.id(), &job, message)
                 });
             if enabled {
                 tools.configure_desktop(request, already_delivered);
             }
             (tools, desktop_text, image_before_text, already_delivered)
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let already_delivered = false;
         if requires_desktop_image && !already_delivered {
             tools.allow_requested_desktop_capture();
@@ -4169,16 +4173,16 @@ impl Worker {
                     },
                 )?;
                 let finished=tools.goal_update().is_none_or(|update|update.status==agent::task_tools::GoalStatus::Complete);
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 let delivered = tools.desktop_delivered();
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let delivered = false;
                 ensure!(!requires_desktop_image || !finished || result.screenshot.is_some() || delivered,
                     "İstenen ekran görüntüsü sohbet eki olarak oluşturulmadı; işlem tamamlanmış sayılmadı.");
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 ensure!(!image_before_text || delivered,
                     "İlk adım tamamlanamadı: masaüstü görüntüsünün sohbete teslimi doğrulanmadı.");
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 ensure!(!desktop_text || (!finished && !image_before_text) || tools.desktop_file_written(),
                     "İstenen masaüstü metin dosyasının yazıldığı doğrulanmadı.");
                 Ok(result)
@@ -4572,32 +4576,177 @@ fn operator_task(text: &str) -> Option<&str> {
     (!text.is_empty() && !text.starts_with('/')).then_some(text)
 }
 
-fn requested_desktop_capture(text: &str) -> bool {
-    let text = text.to_lowercase();
-    if [
-        "atma",
-        "gönderme",
-        "gonderme",
-        "paylaşma",
-        "paylasma",
-        "don't",
-        "do not",
-    ]
-    .iter()
-    .any(|word| text.contains(word))
+fn operator_request_text<'a>(link: &'a Link, job: &WorkspaceJob) -> &'a str {
+    let trusted = |message: &&Message| {
+        message.room == job.selection.room
+            && message.author.data.key == job.actor
+            && !message.withdrawn
+    };
+    let Some(source) = link.messages.get(&job.source).filter(trusted) else {
+        return "";
+    };
+    let retry = source.text.trim().to_lowercase();
+    if matches!(job.automation, Some(AutomationRef::Goal(_)))
+        && matches!(
+            retry.as_str(),
+            "bir daha dene /goal" | "/goal bir daha dene" | "try again /goal" | "/goal try again"
+        )
+        && let Some(quote) = &source.reply
+        && quote.author.data.key == job.actor
+        && let Some(original) = link.messages.get(&quote.id).filter(trusted)
     {
-        return false;
+        return &original.text;
     }
-    (text.contains("masaüst") || text.contains("masaust") || text.contains("desktop"))
-        && (text.contains("görüntü") || text.contains("goruntu") || text.contains("screenshot"))
-        && (text.contains("at")
-            || text.contains("gönder")
-            || text.contains("gonder")
-            || text.contains("send")
-            || text.contains("paylaş"))
+    &source.text
 }
 
-#[cfg(windows)]
+fn requested_desktop_capture(text: &str) -> bool {
+    let text = text.trim_start();
+    let text = if let Some(task) = task_command(text, &["/goal", "/devam"]) {
+        task
+    } else if let Some(interval_and_task) = task_command(text, &["/loop"]) {
+        interval_and_task
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, task)| task.trim_start())
+    } else {
+        text
+    };
+    let mut prose = String::new();
+    let mut quote = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with('>') && quote.is_none() {
+            continue;
+        }
+        let mut previous = None;
+        let mut characters = line.chars().peekable();
+        while let Some(character) = characters.next() {
+            if let Some(close) = quote {
+                if character == close {
+                    quote = None;
+                }
+            } else {
+                let apostrophe = matches!(character, '\'' | '’')
+                    && previous.is_some_and(char::is_alphanumeric)
+                    && characters.peek().is_some_and(|next| next.is_alphanumeric());
+                let close = match character {
+                    '"' | '`' => Some(character),
+                    '\'' if !apostrophe => Some(character),
+                    '“' => Some('”'),
+                    '‘' => Some('’'),
+                    _ => None,
+                };
+                if close.is_some() {
+                    quote = close;
+                    prose.push(' ');
+                } else {
+                    prose.push(character);
+                }
+            }
+            previous = Some(character);
+        }
+        prose.push(' ');
+    }
+    let prose = prose.to_lowercase().replace('\u{0307}', "");
+    let first_clause = prose
+        .split(['.', '?', '!', ';', ':'])
+        .next()
+        .unwrap_or_default();
+    let words: Vec<_> = first_clause
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty() && !["please", "lütfen", "lutfen"].contains(word))
+        .collect();
+    let starts_request = [
+        &["send"][..],
+        &["share"],
+        &["post"],
+        &["take"],
+        &["capture"],
+        &["first", "send"],
+        &["first", "take"],
+        &["first", "capture"],
+        &["can", "you", "send"],
+        &["could", "you", "send"],
+        &["can", "you", "take"],
+        &["go", "to"],
+        &["show", "the", "desktop"],
+        &["then", "send"],
+        &["önce"],
+        &["ilk", "önce"],
+        &["ilk", "olarak"],
+        &["düz", "masaüstüne"],
+        &["boş", "masaüstüne"],
+    ]
+    .iter()
+    .any(|prefix| words.starts_with(prefix))
+        || words
+            .first()
+            .is_some_and(|word| word.starts_with("masaüst") || word.starts_with("masaust"));
+    let desktop = words.iter().any(|word| {
+        *word == "desktop" || word.starts_with("masaüst") || word.starts_with("masaust")
+    });
+    let screenshot = words.iter().any(|word| {
+        *word == "screenshot" || word.starts_with("görüntü") || word.starts_with("goruntu")
+    }) || words.windows(2).any(|pair| pair == ["screen", "shot"]);
+    let shares = words.iter().enumerate().any(|(index, word)| match *word {
+        "send" | "share" | "post" => {
+            let object = &words[index + 1..];
+            let qualifiers = [
+                "a",
+                "an",
+                "the",
+                "my",
+                "your",
+                "me",
+                "us",
+                "desktop",
+                "current",
+                "full",
+                "visible",
+                "unobstructed",
+                "bare",
+            ];
+            let mut direct = object
+                .iter()
+                .copied()
+                .skip_while(|word| qualifiers.contains(word));
+            matches!(
+                (direct.next(), direct.next()),
+                (Some("screenshot"), _) | (Some("screen"), Some("shot"))
+            ) || (object.first() == Some(&"it")
+                && words[..index]
+                    .iter()
+                    .any(|verb| matches!(*verb, "take" | "capture")))
+        }
+        "at" | "atar" | "atabilir" | "gönder" | "gönderir" | "gonder" | "gonderir"
+        | "gönderebilir" | "gonderebilir" | "paylaş" | "paylas" | "paylaşır" | "paylasir" => {
+            words[..index].iter().any(|word| {
+                word.starts_with("görüntü") || word.starts_with("goruntu") || *word == "screenshot"
+            })
+        }
+        _ => false,
+    });
+    let negated = prose.split(|c: char| !c.is_alphanumeric()).any(|word| {
+        matches!(
+            word,
+            "no" | "not"
+                | "never"
+                | "don"
+                | "without"
+                | "atma"
+                | "gönderme"
+                | "gonderme"
+                | "paylaşma"
+                | "paylasma"
+                | "olmadan"
+                | "değil"
+                | "nasıl"
+                | "nasil"
+        )
+    });
+    starts_request && desktop && screenshot && shares && !negated
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn desktop_delivery_id(job: &WorkspaceJob) -> Uuid {
     let source_id = match job.automation {
         Some(AutomationRef::Goal(id)) => id,
@@ -4606,10 +4755,24 @@ fn desktop_delivery_id(job: &WorkspaceJob) -> Uuid {
     Uuid::from_u128(source_id.as_u128() ^ 0xa78e_24ce_5d33_06fb_9b47_d002_8ebc_8ac0)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
+fn desktop_delivery_acknowledged(agent_id: &str, job: &WorkspaceJob, message: &Message) -> bool {
+    message.client_id == desktop_delivery_id(job)
+        && message.room == job.selection.room
+        && message.author.data.key == agent_id
+        && !message.withdrawn
+        && message.attachment.as_ref().is_some_and(|attachment| {
+            attachment.name == DESKTOP_SCREENSHOT_NAME
+                && (1..=MAX_ATTACHMENT).contains(&attachment.bytes)
+                && !attachment.binary
+        })
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 fn desktop_request(text: &str) -> agent::task_tools::DesktopRequest {
     let lower = text.to_lowercase();
     let capture = requested_desktop_capture(text);
+    #[cfg(windows)]
     let reveal = capture
         && [
             "düz masaüst",
@@ -4647,42 +4810,11 @@ fn desktop_request(text: &str) -> agent::task_tools::DesktopRequest {
             .iter()
             .any(|word| lower.contains(word));
     agent::task_tools::DesktopRequest {
+        #[cfg(windows)]
         reveal,
         text_file,
         image_before_text,
     }
-}
-
-fn operator_request_text(link: &Link, job: &WorkspaceJob) -> String {
-    let mut request = job.task.clone();
-    if let Some(source) = link
-        .messages
-        .get(&job.source)
-        .filter(|message| message.room == job.selection.room)
-    {
-        request.push('\n');
-        request.push_str(&source.text);
-        let mut quote = source.reply.as_ref();
-        let mut visited = BTreeSet::new();
-        for _ in 0..8 {
-            let Some(current) = quote else {
-                break;
-            };
-            if !visited.insert(current.id) {
-                break;
-            }
-            if current.author.data.key == job.actor {
-                request.push('\n');
-                request.push_str(&current.text);
-            }
-            quote = link
-                .messages
-                .get(&current.id)
-                .filter(|message| message.room == job.selection.room)
-                .and_then(|message| message.reply.as_ref());
-        }
-    }
-    request
 }
 
 fn workspace_continue(text: &str) -> Option<&str> {
@@ -4745,6 +4877,33 @@ mod automation_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_preapproval_matches_direct_requests_only() {
+        for request in [
+            "Send me a screenshot of the desktop.",
+            "Send me a screen shot of the desktop.",
+            "First take a desktop screenshot and send it, then create a text file on the desktop.",
+            "Masaüstü görüntüsünü çekip bana at.",
+            "Önce masaüstüne geç ve görüntüyü gönder, sonra masaüstüne bir metin dosyası oluştur.",
+        ] {
+            assert!(requested_desktop_capture(request), "{request}");
+        }
+        for request in [
+            "What is a desktop screenshot?",
+            "Masaüstü görüntüsü hata veriyor.",
+            "Send a report on desktop screenshots.",
+            "Do not send a desktop screenshot.",
+            "Send a desktop screenshot. Actually, don't.",
+            "Masaüstü görüntüsünü bana atma.",
+            "Should I run \"send a desktop screenshot\"?",
+            "> Send a desktop screenshot.",
+            "'Send a desktop screenshot.'",
+            "Masaüstü görüntüsünü nasıl gönder?",
+        ] {
+            assert!(!requested_desktop_capture(request), "{request}");
+        }
+    }
 
     #[test]
     fn steering_requires_the_paired_operator_room_and_original_quote() -> Result<()> {

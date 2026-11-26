@@ -7,9 +7,14 @@ use std::{
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{Identity, validate_handle};
+use crate::{
+    identity::{Identity, validate_handle},
+    local_file::{open_regular, read_bounded},
+};
 
 const FILE: &str = "remembered.json";
+const CLEANUP_FILE: &str = "remembered.cleanup";
+const MAX_RECORD_BYTES: usize = 24_000;
 
 #[derive(Serialize, Deserialize)]
 struct Record {
@@ -18,19 +23,35 @@ struct Record {
 }
 
 fn read(root: &Path) -> Result<Option<Record>> {
-    let path = root.join(FILE);
-    match fs::metadata(&path) {
-        Ok(meta) => ensure!(meta.len() <= 24_000, "Geçersiz oturum dosyası"),
+    read_record(root, FILE)
+}
+
+fn read_record(root: &Path, name: &str) -> Result<Option<Record>> {
+    let path = root.join(name);
+    let file = match open_regular(&path, false) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = file.metadata()?;
+        // Leave an unsafe inode untouched. Successful password login can replace the record.
+        ensure!(
+            metadata.mode() & 0o077 == 0 && metadata.nlink() == 1,
+            "Hatırlanan oturum dosyası izinleri veya bağlantıları güvenli değil"
+        );
     }
-    let record: Record = serde_json::from_slice(&fs::read(path)?)?;
+    let record: Record = serde_json::from_slice(&read_bounded(&file, MAX_RECORD_BYTES)?)?;
     validate_handle(&record.handle)?;
     Ok(Some(record))
 }
 
 pub fn save(root: &Path, identity: &Identity) -> Result<()> {
     let seed = identity.session_secret()?;
+    clear_pending(root)?;
     let previous = read(root).ok().flatten();
     let record = Record {
         handle: identity.card.data.handle.clone(),
@@ -39,6 +60,12 @@ pub fn save(root: &Path, identity: &Identity) -> Result<()> {
     let result = (|| -> Result<()> {
         fs::create_dir_all(root)?;
         let mut file = tempfile::NamedTempFile::new_in(root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(&serde_json::to_vec(&record)?)?;
         file.as_file().sync_all()?;
         file.persist(root.join(FILE)).map_err(|error| error.error)?;
@@ -71,24 +98,58 @@ pub fn load(root: &Path) -> Result<Option<Identity>> {
     Ok(Some(identity))
 }
 
-pub fn forget(root: &Path) -> Result<()> {
-    let saved = read(root).ok().flatten();
-    match fs::remove_file(root.join(FILE)) {
+fn remove_record(root: &Path, name: &str) -> Result<()> {
+    match fs::remove_file(root.join(name)) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    if let Some(record) = saved {
+    Ok(())
+}
+
+fn clear_pending(root: &Path) -> Result<()> {
+    if let Some(record) = read_record(root, CLEANUP_FILE)? {
         system::discard(&record.protected)?;
+        remove_record(root, CLEANUP_FILE)?;
     }
     Ok(())
 }
 
-pub fn forget_account(root: &Path, handle: &str) -> Result<()> {
-    if read(root)?.is_some_and(|saved| saved.handle == handle) {
-        forget(root)?;
-    }
+fn retire_record(root: &Path) -> Result<()> {
+    // Disable automatic sign-in before deleting the corresponding keyring item.
+    fs::rename(root.join(FILE), root.join(CLEANUP_FILE))?;
     Ok(())
+}
+
+pub fn forget(root: &Path) -> Result<()> {
+    clear_pending(root)?;
+    if read(root).ok().flatten().is_some() {
+        retire_record(root)?;
+        clear_pending(root)
+    } else {
+        remove_record(root, FILE)
+    }
+}
+
+pub fn forget_account(root: &Path, handle: &str) -> Result<Option<anyhow::Error>> {
+    forget_account_with(root, handle, clear_pending)
+}
+
+fn forget_account_with(
+    root: &Path,
+    handle: &str,
+    cleanup: impl Fn(&Path) -> Result<()>,
+) -> Result<Option<anyhow::Error>> {
+    if read(root)?.is_some_and(|saved| saved.handle == handle) {
+        cleanup(root)?;
+        retire_record(root)?;
+        return Ok(cleanup(root).err());
+    }
+    Ok(match read_record(root, CLEANUP_FILE) {
+        Ok(Some(saved)) if saved.handle == handle => cleanup(root).err(),
+        Ok(_) => None,
+        Err(error) => Some(error),
+    })
 }
 
 #[cfg(windows)]
@@ -166,55 +227,36 @@ mod system {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod system {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::{collections::HashMap, future::Future, time::Duration};
 
-    use anyhow::{Context, Result, bail, ensure};
+    use anyhow::{Context, Result};
+    use secret_service::{EncryptionType, SecretService};
     use zeroize::Zeroizing;
 
     use crate::identity::{decode, encode, random};
 
-    fn command(action: &str, slot: &str, input: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
-        let mut command = Command::new("secret-tool");
-        command.arg(action);
-        if input.is_some() {
-            command.arg("--label=ChatOid");
-        }
-        let mut child = command
-            .args(["application", "chatoid", "session", slot])
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
+    fn run<T>(task: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(8), task)
+                    .await
+                    .context("Linux anahtar kasası yanıt vermedi")?
             })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Linux anahtar kasası için secret-tool gerekli")?;
-        if let Some(input) = input
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            stdin.write_all(input.as_bytes())?;
-        }
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                ensure!(status.success(), "Linux anahtar kasası oturumu açamadı");
-                return Ok(Zeroizing::new(child.wait_with_output()?.stdout));
-            }
-            if started.elapsed() > Duration::from_secs(8) {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("Linux anahtar kasası yanıt vermedi");
-            }
-            thread::sleep(Duration::from_millis(30));
-        }
+    }
+
+    async fn connect() -> Result<SecretService<'static>> {
+        SecretService::connect(EncryptionType::Dh)
+            .await
+            .context("Linux anahtar kasasına (Secret Service) bağlanılamadı")
+    }
+
+    fn attributes(slot: &str) -> HashMap<&str, &str> {
+        // Match the attributes originally used with libsecret's secret-tool.
+        HashMap::from([("application", "chatoid"), ("session", slot)])
     }
 
     fn slot(secret: &[u8]) -> Result<&str> {
@@ -226,41 +268,229 @@ mod system {
     pub fn protect(seed: &[u8]) -> Result<Vec<u8>> {
         let slot = encode(random::<24>()?);
         let value = Zeroizing::new(encode(seed));
-        command("store", &slot, Some(&value))?;
+        run(async {
+            let service = connect().await?;
+            let collection = service.get_default_collection().await?;
+            if collection.is_locked().await? {
+                collection.unlock().await?;
+            }
+            collection
+                .create_item(
+                    "ChatOid",
+                    attributes(&slot),
+                    value.as_bytes(),
+                    true,
+                    "text/plain",
+                )
+                .await?;
+            Ok(())
+        })?;
         Ok(slot.into_bytes())
     }
+
     pub fn unprotect(protected: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let bytes = command("lookup", slot(protected)?, None)?;
+        let slot = slot(protected)?;
+        let bytes = run(async {
+            let service = connect().await?;
+            let items = service.search_items(attributes(slot)).await?;
+            let item = if let Some(item) = items.unlocked.first() {
+                item
+            } else {
+                let item = items
+                    .locked
+                    .first()
+                    .context("Hatırlanan oturum anahtar kasasında bulunamadı")?;
+                item.unlock().await?;
+                item
+            };
+            Ok(Zeroizing::new(item.get_secret().await?))
+        })?;
         let seed = Zeroizing::new(decode::<32>(std::str::from_utf8(&bytes)?.trim())?);
         Ok(Zeroizing::new(seed.to_vec()))
     }
+
     pub fn discard(protected: &[u8]) -> Result<()> {
-        command("clear", slot(protected)?, None)?;
+        let Ok(slot) = slot(protected) else {
+            return Ok(());
+        };
+        run(async {
+            let service = connect().await?;
+            let items = service.search_items(attributes(slot)).await?;
+            for item in items.unlocked {
+                item.delete().await?;
+            }
+            for item in items.locked {
+                item.unlock().await?;
+                item.delete().await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod system {
+    use anyhow::{Result, bail};
+    use zeroize::Zeroizing;
+
+    pub fn protect(_: &[u8]) -> Result<Vec<u8>> {
+        bail!("Bu platformda oturum hatırlama kullanılamıyor")
+    }
+
+    pub fn unprotect(_: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        bail!("Bu platformda oturum hatırlama kullanılamıyor")
+    }
+
+    pub fn discard(_: &[u8]) -> Result<()> {
         Ok(())
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, unix))]
+mod record_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn rejects_unsafe_record_without_changing_permissions() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let record = root.path().join(FILE);
+        let other = root.path().join("other");
+        fs::write(&other, br#"{"handle":"deniz","protected":[]}"#)?;
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o644))?;
+
+        symlink(&other, &record)?;
+        assert!(read(root.path()).is_err());
+        fs::remove_file(&record)?;
+
+        fs::hard_link(&other, &record)?;
+        assert!(read(root.path()).is_err());
+        assert_eq!(fs::metadata(&other)?.permissions().mode() & 0o777, 0o644);
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o600))?;
+        assert!(read(root.path()).is_err());
+
+        fs::remove_file(other)?;
+        assert_eq!(read(root.path())?.unwrap().handle, "deniz");
+        Ok(())
+    }
+
+    #[test]
+    fn logout_can_complete_when_keyring_cleanup_fails() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut metadata = tempfile::NamedTempFile::new_in(root.path())?;
+        serde_json::to_writer(
+            &mut metadata,
+            &Record {
+                handle: "deniz".into(),
+                protected: vec![1],
+            },
+        )?;
+        metadata.persist(root.path().join(FILE))?;
+
+        fs::create_dir(root.path().join(CLEANUP_FILE))?;
+        assert!(forget_account_with(root.path(), "deniz", |_| Ok(())).is_err());
+        assert!(root.path().join(FILE).exists());
+        fs::remove_dir(root.path().join(CLEANUP_FILE))?;
+
+        let error = forget_account_with(root.path(), "deniz", |path| {
+            ensure!(!path.join(CLEANUP_FILE).exists(), "keyring unavailable");
+            Ok(())
+        })?;
+        assert!(error.is_some());
+        assert!(load(root.path())?.is_none());
+        assert!(root.path().join(CLEANUP_FILE).exists());
+        assert!(
+            forget_account_with(root.path(), "deniz", |path| remove_record(
+                path,
+                CLEANUP_FILE
+            ))?
+            .is_none()
+        );
+        assert!(!root.path().join(CLEANUP_FILE).exists());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::identity::Role;
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires an unlocked Secret Service keyring"
+    )]
     fn remembered_session_survives_restart_and_uses_the_original_identity() -> Result<()> {
         let root = tempfile::tempdir()?;
         let identity = Identity::generate(Role::Human, "deniz", "Deniz")?;
         let account = root.path().join("accounts/deniz.identity");
         identity.save(&account, Some("123456"))?;
         save(root.path(), &identity)?;
+        #[cfg(target_os = "linux")]
+        let old_slot = read(root.path())?.unwrap().protected;
         let encoded = fs::read(root.path().join(FILE))?;
         assert!(!encoded.windows(6).any(|window| window == b"123456"));
         assert_eq!(load(root.path())?.expect("remembered").id(), identity.id());
-        forget_account(root.path(), "bobby")?;
+        assert!(forget_account(root.path(), "bobby")?.is_none());
         assert!(load(root.path())?.is_some());
         fs::remove_file(&account)?;
-        Identity::generate(Role::Human, "deniz", "Yeni Deniz")?.save(&account, Some("abcdef"))?;
+        let replacement = Identity::generate(Role::Human, "deniz", "Yeni Deniz")?;
+        replacement.save(&account, Some("abcdef"))?;
         assert!(load(root.path()).is_err());
-        forget_account(root.path(), "deniz")?;
+        assert!(forget_account(root.path(), "deniz")?.is_none());
+        assert!(load(root.path())?.is_none());
+        assert!(!root.path().join(CLEANUP_FILE).exists());
+        #[cfg(target_os = "linux")]
+        assert!(system::unprotect(&old_slot).is_err());
+
+        save(root.path(), &replacement)?;
+        fs::rename(root.path().join(FILE), root.path().join(CLEANUP_FILE))?;
+        assert!(load(root.path())?.is_none());
+        assert!(forget_account(root.path(), "deniz")?.is_none());
+        assert!(!root.path().join(CLEANUP_FILE).exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the legacy secret-tool executable and an unlocked Secret Service keyring"]
+    fn reads_session_saved_with_legacy_secret_tool() -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        use crate::identity::{encode, random};
+        use zeroize::Zeroizing;
+
+        let root = tempfile::tempdir()?;
+        let identity = Identity::generate(Role::Human, "deniz", "Deniz")?;
+        identity.save(&root.path().join("accounts/deniz.identity"), Some("123456"))?;
+        let seed = Zeroizing::new(encode(identity.session_secret()?.as_slice()));
+        let slot = encode(random::<24>()?);
+        let mut tool = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label=ChatOid",
+                "application",
+                "chatoid",
+                "session",
+                &slot,
+            ])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        tool.stdin.take().unwrap().write_all(seed.as_bytes())?;
+        assert!(tool.wait()?.success());
+
+        let mut metadata = tempfile::NamedTempFile::new_in(root.path())?;
+        serde_json::to_writer(
+            &mut metadata,
+            &Record {
+                handle: "deniz".into(),
+                protected: slot.into_bytes(),
+            },
+        )?;
+        metadata.persist(root.path().join(FILE))?;
+        assert_eq!(load(root.path())?.unwrap().id(), identity.id());
+        forget(root.path())?;
         assert!(load(root.path())?.is_none());
         Ok(())
     }

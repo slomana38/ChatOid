@@ -15,19 +15,29 @@ jobs:
         include:
           - os: windows-2022
             platform: windows
+            target: x86_64-pc-windows-msvc
           - os: ubuntu-24.04
             platform: linux
+            target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install Linux window dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev desktop-file-utils libglib2.0-bin
+      - name: Test Linux installer and desktop launchers
+        if: runner.os == 'Linux'
+        run: python -m unittest discover --start-directory tests --pattern 'test_linux_installer.py'
       - run: rustup update stable
+      - run: rustup target add ${{ matrix.target }} --toolchain stable
+      - run: rustup component add rustfmt --toolchain stable
       - run: cargo +stable fmt --check
-      - run: cargo +stable test --locked
-      - run: cargo +stable build --release --locked --bins
-      - run: python tools/package.py ${{ matrix.platform }}
+      - run: cargo +stable test --locked --target ${{ matrix.target }}
+      - run: cargo +stable build --release --locked --bins --target ${{ matrix.target }}
+      - run: python tools/package.py ${{ matrix.platform }} --binaries target/${{ matrix.target }}/release
       - uses: actions/upload-artifact@v4
         with:
           name: chatoid-${{ matrix.platform }}
@@ -38,6 +48,9 @@ jobs:
     needs: binaries
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@v4
         with:
           pattern: chatoid-*

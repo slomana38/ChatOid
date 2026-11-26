@@ -14,7 +14,7 @@ Bir mesaja **Yanıtla** ile alıntı ekleyebilirsin. Alıntıya tıklamak kaynak
 
 Grup sohbetinde `@` yazarak bir üyeyi etiketleyebilir, bir avatara veya etikete tıklayarak kişi profilini açabilirsin. **Profilim** ekranında görünen ad ve fotoğraf değiştirilebilir. Ajan kaydında hazır ad ve avatar önerileri bulunur. Ajanın **Gizlilik** ayarında özetlenen cihaz bilgileri varsayılan olarak kabul edilmiş arkadaşlara görünür. Sohbetin sağ tık menüsündeki **Mesaj bilgisi** gönderim saatini ve alıcıların teslim veya okuma durumunu gösterir.
 
-Windows’ta ataç, sürükle-bırak veya mesaj alanında `Ctrl+V` ile ek seçebilirsin. Güncel hostlarda sınır 32 MiB, eski hostlarda uygulamanın gösterdiği sınır geçerlidir. Ekler önce taslakta görünür. JPG ve PNG sohbet içinde önizlenir. Taslaklar hesap ve sohbet başına saklanır. **Ayarlar → Görünüm** ile bir arka plan seçebilir ve seçili sohbete özel arka plan belirleyebilirsin.
+Windows ve Linux’ta ataç, sürükle-bırak veya mesaj alanında `Ctrl+V` ile ek seçebilirsin. Güncel hostlarda sınır 32 MiB, eski hostlarda uygulamanın gösterdiği sınır geçerlidir. Ekler önce taslakta görünür. JPG ve PNG sohbet içinde önizlenir. Taslaklar hesap ve sohbet başına saklanır. **Ayarlar → Görünüm** ile bir arka plan seçebilir ve seçili sohbete özel arka plan belirleyebilirsin.
 
 **Kişiler ve istekler → Bağlantımı paylaş** ile tek bir imzalı bağlantı paylaşabilirsin. Alıcıya gidecek istek, alıcının hostu çevrimdışıyken kuyrukta kalır. Aynı cihazdaki profiller, gizlilik ayarında izin verirlerse kişi ekleme ekranında görünür. **Arkadaşlıktan çıkar** işlemi bire bir sohbeti iki tarafta salt okunur yapar ve geçmişi saklar. Ayrı bir hosttaki grup daveti ve kabulü, ilgili arkadaşlık hostundan güncel doğrulama bekler.
 
@@ -24,7 +24,7 @@ Yerel sohbet listesi boşsa ve host eski kayıtları hâlâ tutuyorsa, aynı hes
 
 Cihazdaki her ChatOid hesabı arkadaşlarını, isteklerini, sohbet önbelleğini, arşivini ve bekleyen mesajlarını kendi profiline kaydeder. Uygulama güncellendiğinde aynı cihazda, aynı hesapla ve aynı veri klasörüyle aç.
 
-Giriş ekranındaki **Beni hatırla** seçeneği, sonraki açılışta bu cihazda son seçilen insan hesabını açar. **Oturumu kapat** otomatik girişi iptal eder. Windows oturum anahtarını DPAPI ile korur. Linux'ta otomatik giriş için çalışan bir Secret Service ve `secret-tool` (`libsecret-tools`) gerekir. Bu bileşenler yoksa parola ile giriş yapabilirsin.
+Giriş ekranındaki **Beni hatırla** seçeneği, sonraki açılışta bu cihazda son seçilen insan hesabını açar. **Oturumu kapat** otomatik girişi iptal eder. Windows oturum anahtarını DPAPI ile korur. Linux'ta otomatik giriş için masaüstü oturumunda çalışan bir Secret Service gerekir. Anahtar kasası kullanılamadığında parola ile giriş yapabilirsin.
 
 ## Ajan kurma
 
@@ -88,11 +88,13 @@ Bir görev mesajına dosya veya ekran görüntüsü ekleyebilirsin. Ajan sağ pa
 
 Yeni görevlerde «oluşturduğun dosyayı sohbete ekle» diyebilirsin. Codex’in seçtiği dosyanın adı, göreli yolu ve boyutu sağ panelde **Dosya paylaşımı** altında görünür. Dosyayı ayrıca onaylarsan görev tamamlandığında alıntılı yanıta eklenir. Güncel host 32 MiB’a kadar, ek destekleyen eski host 1 MiB’a kadar dosya kabul eder. Her görev yanıtı bir ek taşır.
 
-Windows’ta operatör görevi başlatmadan önce bu panelde bir pencere seçebilir. Pencere görüntüsü alma, tıklama, kaydırma ve metin yazma işlemleri ayrı ayrı yerel onay ister. Görüntü analizi onaylanırsa pencerenin görüntüsü Codex’e gönderilir. Pencere onayı, görüntünün sohbet eki olarak da gönderilip gönderilmeyeceğini gösterir.
+Linux’ta tam masaüstü görüntüleri sistemin etkileşimli XDG ekran görüntüsü portalı üzerinden alınır. Bu portal Wayland oturumlarında da kullanılabilir. Pencere seçimi ve etkileşimi, gerekli özellikleri sunan yerel X11 oturumlarında kullanılabilir.
+
+Windows ve desteklenen X11 oturumlarında operatör görevi başlatmadan önce bu panelde bir pencere seçebilir. Pencere görüntüsü alma, tıklama, kaydırma ve metin yazma işlemleri ayrı ayrı yerel onay ister. Görüntü analizi onaylanırsa pencerenin görüntüsü Codex’e gönderilir. Pencere onayı, görüntünün sohbet eki olarak da gönderilip gönderilmeyeceğini gösterir. X11’de onaydan sonra seçilen pencereyi 12 saniye içinde öne getirmen gerekir. Görüntü ve koordinatlar pencerenin iç alanını temel alır. Metin girişi etkin klavye düzeninde eşlenebilen karakterleri destekler.
 
 Yeni görevlerde Codex çalışırken ilk pencereyi veya başka bir pencereyi seçmeni isteyebilir. **Pencere araçları** bölümünde isteğin nedenini görür, açık pencerelerden birini seçer veya isteği reddedersin. Seçim görev boyunca geçerli olur. Her görüntü ve giriş eylemi ayrıca onay ister.
 
-Codex ayrıca Windows erişilebilirlik bilgilerinden görünür düğme adlarını, öğe türlerini ve konumlarını okumak için izin isteyebilir. Parola alanları ve düzenlenebilir alanların içeriği okunmaz. Okunabilen öğeler, uygulamanın Windows’a sunduğu erişilebilirlik bilgilerine bağlıdır.
+Codex ayrıca görünür düğme adlarını, öğe türlerini ve konumlarını okumak için izin isteyebilir. Parola alanları ve düzenlenebilir alanların içeriği okunmaz. Okunabilen öğeler, uygulamanın Windows erişilebilirlik arayüzüne veya Linux AT-SPI veriyoluna sunduğu bilgilere bağlıdır.
 
 Yeni görevlerde Codex, son onaylı okumada bulunan bir düğmeyi fareyi hareket ettirmeden çalıştırmayı isteyebilir. Onay kartında düğmenin adı gösterilir. Onay sırasında düğme değişirse önce pencerenin yeniden okunması gerekir.
 
@@ -112,7 +114,7 @@ Bu seçim Codex'in yerel sandbox ağ politikasına iletilir. ChatOid, Windows g�
 
 ## Derleme ve test
 
-Rust 1.88 veya üstü ile yerel bir C derleyicisi gerekir. Windows için MSVC kullan. Ubuntu 24.04’te pencere ve OpenGL bağımlılıkları için `libx11-dev`, `libxcb1-dev`, `libxkbcommon-dev`, `libwayland-dev` ve `libgl1-mesa-dev` paketlerini kur.
+Rust 1.89 veya üstü ile yerel bir C derleyicisi gerekir. Windows için MSVC kullan. Ubuntu 24.04’te pencere ve OpenGL bağımlılıkları için `libx11-dev`, `libxcb1-dev`, `libxkbcommon-dev`, `libwayland-dev` ve `libgl1-mesa-dev` paketlerini kur.
 
 ```sh
 cargo build --release --locked --bins
@@ -137,7 +139,19 @@ python tools/package.py manifest
 python tools/package.py verify
 ```
 
-`windows` ve `linux` komutları, o platformda üretilen `target/release` dosyalarını kullanır. İki platformun arşivlerini aynı `dist` dizininde birleştirip SHA-256 listesini oluştur. GitHub Actions, `v0.1.0` gibi bir sürüm etiketi gönderildiğinde iki platformda derler, test eder ve doğrulanmış dağıtım çıktısını saklar.
+`windows` ve `linux` komutları, o platformda üretilen `target/release` dosyalarını kullanır. Linux arşivi x86_64 Ubuntu 24.04 için `chatoid` ve `chatoid-agent` çalıştırılabilir dosyalarını içerir; Windows arşivi `.exe` dosyalarını içerir. Dağıtım dosyaları `chatoid-<sürüm>-windows-x64.zip`, `chatoid-<sürüm>-linux-x64.tar.gz` ve `chatoid-<sürüm>-source.zip` adlarını alır.
+
+Linux arşivini açıp kurulum aracını çalıştırarak iki uygulama için menü başlatıcıları oluşturabilirsin:
+
+```sh
+tar -xzf chatoid-0.1.2-linux-x64.tar.gz
+cd chatoid-0.1.2-linux-x64
+./install-linux.py
+```
+
+Kurulum kullanıcı hesabıyla yapılır; `sudo` gerekmez. İki çalıştırılabilir dosya, mutlak bir `XDG_BIN_HOME` ayarlıysa oraya, değilse `~/.local/bin` dizinine kopyalanır. Başlatıcılar ve SVG simgeleri mutlak `XDG_DATA_HOME` ayarlıysa onun altına, değilse `~/.local/share` dizinine kurulur. Arşivdeki simgeler uygulamanın insan ve ajan renklerini kullanır. Kurulum aracı Python 3 ister.
+
+İki platformun arşivlerini aynı `dist` dizininde birleştirip SHA-256 listesini oluştur. `verify`, listelenen arşivlerin sağlama toplamlarını, içeriklerini ve çalıştırılabilir dosyaların mimarisini denetler. GitHub Actions, `v0.1.0` gibi bir sürüm etiketi gönderildiğinde Windows ve Linux x86_64 hedeflerinde derler, test eder ve doğrulanmış dağıtım çıktısını saklar.
 
 ### Komut menüsü, döngüler ve hedefler
 
